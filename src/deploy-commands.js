@@ -54,6 +54,37 @@ const commands = [
     .addStringOption(o => o.setName('query').setDescription('Ban ID (e.g. 004) or player username').setRequired(true))
     .toJSON(),
 
+  // ── /banlist ────────────────────────────────────────────────────────────────────
+  new SlashCommandBuilder()
+    .setName('banlist')
+    .setDescription('List banned players (compact)')
+    .addStringOption(o => o.setName('scope').setDescription('Which bans to show (default: active)').setRequired(false).addChoices(
+      { name: 'Active only', value: 'active' },
+      { name: 'All', value: 'all' },
+    ))
+    .toJSON(),
+
+  // ── /unban ────────────────────────────────────────────────────────────────────────
+  new SlashCommandBuilder()
+    .setName('unban')
+    .setDescription('Mark a ban as lifted and announce it in the ban log')
+    .addStringOption(o => o.setName('ban_id').setDescription('Ban ID, e.g. 004').setRequired(true))
+    .addStringOption(o => o.setName('reason').setDescription('Why the ban is being lifted').setRequired(false))
+    .toJSON(),
+
+  // ── /stats ────────────────────────────────────────────────────────────────────────
+  new SlashCommandBuilder()
+    .setName('stats')
+    .setDescription('Show the moderation dashboard (bans, wars, tickets)')
+    .toJSON(),
+
+  // ── /history ────────────────────────────────────────────────────────────────────────
+  new SlashCommandBuilder()
+    .setName('history')
+    .setDescription('Show a player\'s ban history timeline')
+    .addStringOption(o => o.setName('player').setDescription('Minecraft username to look up').setRequired(true))
+    .toJSON(),
+
   // ── /log-war ────────────────────────────────────────────────────────────────
   new SlashCommandBuilder()
     .setName('log-war')
@@ -156,8 +187,16 @@ const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
 
 (async () => {
   try {
-    console.log('Registering slash commands...');
-    await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: commands });
+    // If GUILD_ID is set, register to that guild only — updates are near-instant,
+    // which is ideal for development. Without it, register globally (can take up
+    // to ~1 hour to propagate) for production use across every server.
+    const guildId = process.env.GUILD_ID;
+    const route = guildId
+      ? Routes.applicationGuildCommands(process.env.CLIENT_ID, guildId)
+      : Routes.applicationCommands(process.env.CLIENT_ID);
+
+    console.log(`Registering slash commands ${guildId ? `to guild ${guildId}` : 'globally'}...`);
+    await rest.put(route, { body: commands });
     console.log(`✅ Registered ${commands.length} slash commands successfully.`);
   } catch (err) {
     console.error('❌ Failed to register commands:', err);

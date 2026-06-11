@@ -1,5 +1,6 @@
 const { EmbedBuilder } = require('discord.js');
 const { normalizeBanId } = require('./sheets');
+const { computeBanEnd } = require('./duration');
 
 // ── Branding (configurable via .env) ────────────────────────────────────────────
 // Lets server owners rebrand the bot without touching code.
@@ -71,21 +72,75 @@ function parseEvidence(value) {
   return String(value).split(/[\n,]+/).map(u => u.trim()).filter(Boolean);
 }
 
-function applyEvidence(embed, urls) {
-  if (urls.length === 0) {
+// Renders the evidence field. `urls` are clickable links (e.g. a permanent
+// archive-message link, or per-screenshot URLs); `imageUrl` is what to render
+// inline (an `attachment://name` reference keeps the preview permanent); `count`
+// overrides the displayed screenshot count when the files are attached to the
+// message rather than linked.
+function applyEvidence(embed, { urls = [], imageUrl = null, count = null } = {}) {
+  const n = count != null ? count : urls.length;
+  if (n === 0) {
     embed.addFields({ name: '📎 Evidence', value: '`none attached`' });
     return;
   }
-  embed.setImage(urls[0]);
-  const lines = urls.map((u, i) => `[Screenshot ${i + 1}](${u})`).join('  ·  ');
-  embed.addFields({ name: `📎 Evidence (${urls.length})`, value: lines });
+  if (imageUrl) embed.setImage(imageUrl);
+  else if (urls.length) embed.setImage(urls[0]);
+
+  const value = urls.length
+    ? urls.map((u, i) => `[Screenshot ${i + 1}](${u})`).join('  ·  ')
+    : `\`${n}\` screenshot(s) attached above`;
+  embed.addFields({ name: `📎 Evidence (${n})`, value });
 }
 
 // A blank inline field to keep the 3-column grid aligned.
 const spacer = () => ({ name: ZWSP, value: ZWSP, inline: true });
 
+// ── Ban expiry helpers ──────────────────────────────────────────────────────────
+// Turn a ban's date + duration into a human "when does it end" string using
+// Discord's auto-localizing timestamps (<t:unix:…>).
+function banEndValue(ban) {
+  const info = computeBanEnd(ban.date, ban.duration);
+  if (info.state === 'permanent') return '🔒 Never · permanent';
+  if (info.state === 'unknown') return '`—`';
+  const sec = Math.floor(info.endMs / 1000);
+  return info.state === 'ended'
+    ? `<t:${sec}:D> · ✅ expired`
+    : `<t:${sec}:D> (<t:${sec}:R>)`;
+}
+
+// Compact one-liner variant for list views.
+function banEndShort(ban) {
+  const info = computeBanEnd(ban.date, ban.duration);
+  if (info.state === 'permanent') return '🔒 permanent';
+  if (info.state === 'unknown') return '';
+  const sec = Math.floor(info.endMs / 1000);
+  return info.state === 'ended' ? '✅ expired' : `ends <t:${sec}:R>`;
+}
+
+const inlineEnds = ban => ({ name: '⌛ Ends', value: banEndValue(ban), inline: true });
+
+// One compact line for /banlist: "🔴 `004` **Player** · ends in 3 days · 🔓 lifted".
+function banListLine(ban, { lifted = false } = {}) {
+  const id = normalizeBanId(ban.ban_id);
+  const sev = SEVERITY_EMOJI[up(ban.severity)] ?? '⚪';
+  const ends = banEndShort(ban);
+  return `${sev} \`${id || '—'}\` **${ban.player_banned || 'Unknown'}**` +
+    (ends ? ` · ${ends}` : '') + (lifted ? ' · 🔓 lifted' : '');
+}
+
+// One line for /history: "`2026-06-01` 🟠 **offense** · `ID 004` · ends in 3d · 🔓 lifted".
+function historyLine(ban, { lifted = false } = {}) {
+  const id = normalizeBanId(ban.ban_id);
+  const sev = SEVERITY_EMOJI[up(ban.severity)] ?? '⚪';
+  const offense = (ban.offense || '—').slice(0, 80);
+  const ends = banEndShort(ban);
+  return `\`${ban.date || '—'}\` ${sev} **${offense}** · \`ID ${id || '—'}\`` +
+    (ends ? ` · ${ends}` : '') + (lifted ? ' · 🔓 lifted' : '');
+}
+
 // ── Ban embed ─────────────────────────────────────────────────────────────────
-function buildBanEmbed(data, evidenceUrls = [], staffMention) {
+// `evidence` is the options object passed to applyEvidence ({ urls, imageUrl, count }).
+function buildBanEmbed(data, evidence = {}, staffMention) {
   const id = normalizeBanId(data.ban_id);
   const embed = new EmbedBuilder()
     .setColor(severityColor(data.severity))
@@ -101,12 +156,14 @@ function buildBanEmbed(data, evidenceUrls = [], staffMention) {
       { name: '📅 Date',     value: `\`${data.date || '—'}\``, inline: true },
       { name: '📂 Appeal',   value: appealLabel(data.appeal_status), inline: true },
 
+      inlineEnds(data), spacer(), spacer(),
+
       { name: '📋 Offense',  value: data.offense || '—', inline: false },
     )
     .setFooter({ text: `${BRAND} • Ban ID: ${id}` })
     .setTimestamp();
 
-  applyEvidence(embed, evidenceUrls);
+  applyEvidence(embed, evidence);
   return embed;
 }
 
@@ -159,10 +216,11 @@ function buildAppealUpdateEmbed(banId, newStatus) {
 }
 
 // ── Lookup embeds ─────────────────────────────────────────────────────────────
-function buildBanLookupEmbed(ban) {
+// `opts.unban` (if the ban has been lifted) = { at, by, reason }.
+function buildBanLookupEmbed(ban, { unban = null } = {}) {
   const id = normalizeBanId(ban.ban_id);
   const embed = new EmbedBuilder()
-    .setColor(severityColor(ban.severity))
+    .setColor(unban ? NEUTRAL : severityColor(ban.severity))
     .setAuthor({ name: `🔍 ${BRAND} · Ban Record` })
     .setTitle(`Ban Record — ID: ${id}`)
     .addFields(
@@ -174,13 +232,68 @@ function buildBanLookupEmbed(ban) {
       { name: '📅 Date',     value: `\`${ban.date || '—'}\``, inline: true },
       { name: '📂 Appeal',   value: appealLabel(ban.appeal_status), inline: true },
 
+      inlineEnds(ban), spacer(), spacer(),
+
       { name: '📋 Offense',  value: ban.offense || '—', inline: false },
+    );
+
+  if (unban) {
+    const when = unban.at ? `<t:${Math.floor(Date.parse(unban.at) / 1000)}:R>` : '';
+    embed.addFields({
+      name: '🔓 Status',
+      value: `**Lifted** ${when}${unban.by ? ` by <@${unban.by}>` : ''}` +
+        (unban.reason ? `\n> ${unban.reason}` : ''),
+      inline: false,
+    });
+  }
+
+  embed.setFooter({ text: `${BRAND} • Ban ID: ${id}` }).setTimestamp();
+  applyEvidence(embed, { urls: parseEvidence(ban.evidence) });
+  return embed;
+}
+
+// ── /banlist (compact) ──────────────────────────────────────────────────────────
+// `lines` is a page's worth of pre-formatted strings; paging metadata controls
+// the title/footer. Built by the caller from rowToBan + banEndShort.
+function buildBanListEmbed({ lines, page = 0, totalPages = 1, total = 0, scope = 'active' }) {
+  return new EmbedBuilder()
+    .setColor(BRAND_COLOR)
+    .setAuthor(brandAuthor(`📋 ${BRAND_NAME} · Ban List`))
+    .setTitle(scope === 'active' ? `Currently Banned — ${total}` : `All Bans — ${total}`)
+    .setDescription(lines.length ? lines.join('\n') : '_No bans to show._')
+    .setFooter(brandFooter(`${BRAND_NAME} • Page ${page + 1}/${totalPages}`))
+    .setTimestamp();
+}
+
+// ── /history (per-player ban timeline) ──────────────────────────────────────────
+function buildHistoryEmbed({ player, lines, page = 0, totalPages = 1, total = 0, activeCount = 0 }) {
+  return new EmbedBuilder()
+    .setColor(activeCount > 0 ? 0xe84343 : NEUTRAL)
+    .setAuthor(brandAuthor(`📜 ${BRAND_NAME} · Player History`))
+    .setTitle(`History — ${player}`)
+    .setDescription(
+      `**${total}** ban(s) on record · **${activeCount}** active.\n\n` +
+      (lines.length ? lines.join('\n') : '_No bans on record._'),
+    )
+    .setFooter(brandFooter(`${BRAND_NAME} • Page ${page + 1}/${totalPages}`))
+    .setTimestamp();
+}
+
+// Posted to the ban log when a ban is lifted via /unban.
+function buildUnbanEmbed({ banId, player, byMention, reason }) {
+  const id = normalizeBanId(banId);
+  return new EmbedBuilder()
+    .setColor(0x57c454)
+    .setAuthor({ name: `🔓 ${BRAND} · Ban Lifted` })
+    .setTitle(`Ban Lifted — ID: ${id}`)
+    .setDescription(`**${player || 'Player'}**'s ban has been lifted by ${byMention}.`)
+    .addFields(
+      { name: '🆔 Ban ID', value: `\`ID: ${id}\``, inline: true },
+      { name: '🔓 Action', value: 'Unbanned', inline: true },
+      ...(reason ? [{ name: '📋 Reason', value: reason, inline: false }] : []),
     )
     .setFooter({ text: `${BRAND} • Ban ID: ${id}` })
     .setTimestamp();
-
-  applyEvidence(embed, parseEvidence(ban.evidence));
-  return embed;
 }
 
 function buildWarLookupEmbed(war) {
@@ -388,6 +501,21 @@ function buildTicketCloseLogEmbed(info) {
   return embed;
 }
 
+// Inactivity warning posted in a ticket before it is auto-closed.
+function buildTicketInactivityEmbed({ idleHours, closeHours }) {
+  const remaining = Math.max(1, Math.round(closeHours - idleHours));
+  return new EmbedBuilder()
+    .setColor(0xf0a500)
+    .setAuthor(brandAuthor(`💤 ${TICKET_BRAND} · Inactivity Notice`))
+    .setTitle('This ticket has gone quiet')
+    .setDescription(
+      `There's been no activity for about **${idleHours}h**. If nobody responds, this ticket ` +
+      `will be **automatically closed in ~${remaining}h**. Send a message to keep it open.`,
+    )
+    .setFooter(brandFooter(TICKET_BRAND))
+    .setTimestamp();
+}
+
 // ── /help ───────────────────────────────────────────────────────────────────────
 function buildHelpEmbed({ isStaff }) {
   const embed = new EmbedBuilder()
@@ -426,8 +554,9 @@ function buildHelpEmbed({ isStaff }) {
       {
         name: '🔨 Moderation logging (staff)',
         value: [
-          '`/log-ban` · `/lookup-ban` · `/update-appeal`',
-          '`/log-war` · `/lookup-war`',
+          '`/log-ban` · `/lookup-ban` · `/banlist`',
+          '`/update-appeal` · `/unban` · `/history`',
+          '`/log-war` · `/lookup-war` · `/stats`',
         ].join('\n'),
         inline: false,
       },
@@ -437,6 +566,34 @@ function buildHelpEmbed({ isStaff }) {
 
   embed.setFooter(brandFooter(BRAND_NAME)).setTimestamp();
   return embed;
+}
+
+// ── /stats ────────────────────────────────────────────────────────────────────
+// `bans` = summarizeBans(...), `wars` = summarizeWars(...) from src/stats.js.
+function buildStatsEmbed({ bans, wars, openTickets }) {
+  const sevLine = ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL', 'PERMANENT']
+    .filter(k => bans.severity[k]).map(k => `${SEVERITY_EMOJI[k]} ${bans.severity[k]}`).join('   ') || '—';
+  const staffLine = bans.topStaff.length
+    ? bans.topStaff.map(([name, n], i) => `\`${i + 1}.\` ${name} — **${n}**`).join('\n')
+    : '—';
+  const warStatusLine = ['APPROVED', 'DENIED', 'PENDING']
+    .filter(k => wars.status[k]).map(k => `${STATUS_EMOJI[k]} ${wars.status[k]}`).join('   ') || '—';
+  const typeLine = ['war', 'raid']
+    .filter(k => wars.type[k]).map(k => `${TYPE_EMOJI[k]} ${wars.type[k]}`).join('   ');
+
+  return new EmbedBuilder()
+    .setColor(BRAND_COLOR)
+    .setAuthor(brandAuthor(`📊 ${BRAND_NAME} · Server Stats`))
+    .setTitle('Moderation Dashboard')
+    .addFields(
+      { name: '🔨 Bans', value: `**${bans.total}** total\n🔴 ${bans.active} active · ✅ ${bans.expired} expired · 🔓 ${bans.lifted} lifted`, inline: true },
+      { name: '⚔️ War / Raid', value: `**${wars.total}** total\n${warStatusLine}${typeLine ? `\n${typeLine}` : ''}`, inline: true },
+      { name: '🎫 Open Tickets', value: `**${openTickets}**`, inline: true },
+      { name: '⚠️ Bans by severity', value: sevLine, inline: false },
+      { name: '🛡️ Top staff', value: staffLine, inline: false },
+    )
+    .setFooter(brandFooter(BRAND_NAME))
+    .setTimestamp();
 }
 
 // ── /ping ───────────────────────────────────────────────────────────────────────
@@ -472,4 +629,14 @@ module.exports = {
   buildTicketCloseLogEmbed,
   buildHelpEmbed,
   buildStatusEmbed,
+  buildBanListEmbed,
+  buildUnbanEmbed,
+  buildTicketInactivityEmbed,
+  buildStatsEmbed,
+  buildHistoryEmbed,
+  banListLine,
+  historyLine,
+  // ── Exported for tests ──
+  parseEvidence,
+  banEndShort,
 };

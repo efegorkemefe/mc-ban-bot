@@ -101,4 +101,4 @@ function isEnabled() {
   return !!process.env.ANTHROPIC_API_KEY;
 }
 
-module.exports = { reviewWhitelist, isEnabled };
+module.exports = { reviewWhitelist, isEnabled, extractJson };

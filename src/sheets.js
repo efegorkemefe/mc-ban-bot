@@ -49,10 +49,10 @@ let _sheetIdCache = null;
 async function getSheetId(sheetName) {
   if (!_sheetIdCache) {
     const sheets = await getSheetsClient();
-    const meta = await sheets.spreadsheets.get({
+    const meta = await withRetry(() => sheets.spreadsheets.get({
       spreadsheetId: SPREADSHEET_ID,
       fields: 'sheets.properties(sheetId,title)',
-    });
+    }));
     _sheetIdCache = {};
     for (const s of meta.data.sheets) _sheetIdCache[s.properties.title] = s.properties.sheetId;
   }
@@ -108,7 +108,7 @@ async function formatRow(sheetName, rowNumber, totalCols, overrides = []) {
     );
   }
 
-  await sheets.spreadsheets.batchUpdate({ spreadsheetId: SPREADSHEET_ID, requestBody: { requests } });
+  await withRetry(() => sheets.spreadsheets.batchUpdate({ spreadsheetId: SPREADSHEET_ID, requestBody: { requests } }));
 }
 
 // ── Auth ────────────────────────────────────────────────────────────────────
@@ -128,6 +128,31 @@ async function getSheetsClient() {
 // Tab names with spaces or "&" (e.g. "War & Raid Approvals") must be quoted.
 function range(sheetName, a1) {
   return `'${sheetName.replace(/'/g, "''")}'!${a1}`;
+}
+
+// ── Retry / backoff ───────────────────────────────────────────────────────────
+// The Sheets API occasionally returns 429 (rate limit) or transient 5xx errors.
+// Retries those a few times with exponential backoff so a brief hiccup doesn't
+// fail a ban/war log. Non-retryable errors (bad range, auth) throw immediately.
+function isRetryable(err) {
+  const status = err?.code ?? err?.response?.status ?? err?.status;
+  return status === 429 || (typeof status === 'number' && status >= 500 && status < 600);
+}
+
+async function withRetry(fn, tries = 3) {
+  let lastErr;
+  for (let attempt = 0; attempt < tries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (!isRetryable(err) || attempt === tries - 1) throw err;
+      const delay = 300 * 2 ** attempt; // 300ms, 600ms, 1200ms…
+      console.warn(`Sheets API call failed (retryable), retrying in ${delay}ms:`, err.message);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+  throw lastErr;
 }
 
 // ── Ban ID helpers ────────────────────────────────────────────────────────────
@@ -151,10 +176,10 @@ function formatBanIdNum(n) {
 // ban is ID 1, and it increments from the highest existing id.
 async function getNextBanId() {
   const sheets = await getSheetsClient();
-  const res = await sheets.spreadsheets.values.get({
+  const res = await withRetry(() => sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
     range: range(BAN_SHEET_NAME, `H${BAN_DATA_START_ROW}:H`),
-  });
+  }));
   const rows = res.data.values || [];
   let max = 0;
   for (const r of rows) {
@@ -169,11 +194,11 @@ async function getNextBanId() {
 // below the divider and overwrites the placeholders as entries fill in.
 async function findNextWriteRow(sheetName, startRow) {
   const sheets = await getSheetsClient();
-  const res = await sheets.spreadsheets.values.get({
+  const res = await withRetry(() => sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
     range: range(sheetName, `A${startRow}:A`),
     majorDimension: 'COLUMNS',
-  });
+  }));
   const colA = (res.data.values && res.data.values[0]) || [];
   for (let i = 0; i < colA.length; i++) {
     const v = String(colA[i] || '').trim();
@@ -207,12 +232,12 @@ async function appendBan(data, evidenceUrls = []) {
     data.appeal_status,
   ];
 
-  await sheets.spreadsheets.values.update({
+  await withRetry(() => sheets.spreadsheets.values.update({
     spreadsheetId: SPREADSHEET_ID,
     range: range(BAN_SHEET_NAME, `A${writeRow}:I${writeRow}`),
     valueInputOption: 'USER_ENTERED',
     requestBody: { values: [row] },
-  });
+  }));
 
   // E (index 4) = Severity stamp; I (index 8) = Appeal Status (muted, centered).
   await formatRow(BAN_SHEET_NAME, writeRow, 9, [
@@ -227,11 +252,27 @@ async function appendBan(data, evidenceUrls = []) {
 
 async function getBanRows() {
   const sheets = await getSheetsClient();
-  const res = await sheets.spreadsheets.values.get({
+  const res = await withRetry(() => sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
     range: range(BAN_SHEET_NAME, 'A3:I'),
-  });
+  }));
   return res.data.values || [];
+}
+
+// Real ban rows only (from BAN_DATA_START_ROW, below the [EXAMPLE] rows/divider),
+// with leftover "START HERE" placeholders skipped. Used by /banlist so example
+// data never shows up in the list.
+async function getBanRecords() {
+  const sheets = await getSheetsClient();
+  const res = await withRetry(() => sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: range(BAN_SHEET_NAME, `A${BAN_DATA_START_ROW}:I`),
+  }));
+  const rows = res.data.values || [];
+  return rows.filter(r => {
+    const a = String((r && r[0]) || '').trim();
+    return a && !/start here/i.test(a);
+  });
 }
 
 // Returns { rowIndex, rowData } (rowIndex is 1-based sheet row) or null.
@@ -267,12 +308,30 @@ async function updateAppealStatus(banId, newStatus) {
   if (!result) return false;
 
   const sheets = await getSheetsClient();
-  await sheets.spreadsheets.values.update({
+  await withRetry(() => sheets.spreadsheets.values.update({
     spreadsheetId: SPREADSHEET_ID,
     range: range(BAN_SHEET_NAME, `I${result.rowIndex}`),
     valueInputOption: 'RAW',
     requestBody: { values: [[newStatus]] },
-  });
+  }));
+  return true;
+}
+
+// Updates the evidence cell (column G) for an existing ban. Used to store a
+// permanent Discord message link after the evidence has been posted to a channel
+// (raw CDN attachment URLs expire, so we never persist those). Returns false if
+// the ban id isn't found.
+async function updateEvidence(banId, evidenceValue) {
+  const result = await findBanById(banId);
+  if (!result) return false;
+
+  const sheets = await getSheetsClient();
+  await withRetry(() => sheets.spreadsheets.values.update({
+    spreadsheetId: SPREADSHEET_ID,
+    range: range(BAN_SHEET_NAME, `G${result.rowIndex}`),
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: [[evidenceValue]] },
+  }));
   return true;
 }
 
@@ -311,12 +370,12 @@ async function appendWar(data) {
   ];
 
   const writeRow = await findNextWriteRow(WAR_SHEET_NAME, WAR_DATA_START_ROW);
-  await sheets.spreadsheets.values.update({
+  await withRetry(() => sheets.spreadsheets.values.update({
     spreadsheetId: SPREADSHEET_ID,
     range: range(WAR_SHEET_NAME, `A${writeRow}:J${writeRow}`),
     valueInputOption: 'USER_ENTERED',
     requestBody: { values: [row] },
-  });
+  }));
 
   // J (index 9) is the Status stamp column (Arial 10pt bold, centered).
   await formatRow(WAR_SHEET_NAME, writeRow, 10, [
@@ -328,10 +387,10 @@ async function appendWar(data) {
 
 async function getWarRows() {
   const sheets = await getSheetsClient();
-  const res = await sheets.spreadsheets.values.get({
+  const res = await withRetry(() => sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
     range: range(WAR_SHEET_NAME, 'A3:J'),
-  });
+  }));
   return res.data.values || [];
 }
 
@@ -370,11 +429,14 @@ module.exports = {
   normalizeBanId,
   formatBanId,
   appendBan,
+  getBanRecords,
   findBanById,
   findBansByPlayer,
   updateAppealStatus,
+  updateEvidence,
   rowToBan,
   appendWar,
+  getWarRows,
   findWarsByTeam,
   rowToWar,
 };

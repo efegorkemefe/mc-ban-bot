@@ -41,9 +41,13 @@ Two Google Sheet tabs are used inside one spreadsheet:
 |---------|--------------|
 | `/log-ban` | Log a ban. You fill in player/offense/severity/etc., then upload evidence screenshots. ID is auto-assigned. |
 | `/update-appeal` | Change the appeal status (`Appealable` / `Unappealable` / `N/A`) for a ban by its ID. |
-| `/lookup-ban` | Find a ban by its ID, or all recent bans for a player username. |
+| `/lookup-ban` | Find a ban by its ID, or all bans for a player username (paged). Shows when the ban ends. |
+| `/banlist` | Compact list of bans. Defaults to **active only**; `scope: all` shows everything (paged). |
+| `/unban` | Mark a ban as **lifted** and announce it in the ban log. Lifted bans show as such in lookups/banlist. |
+| `/history` | A player's full ban **timeline** (newest first) with active/expired/lifted status. |
+| `/stats` | Moderation dashboard: bans by severity, top staff, war/raid counts, open tickets. |
 | `/log-war` | Log a war or raid approval. Posts immediately — no evidence step. |
-| `/lookup-war` | Find war/raid records for a team or player. |
+| `/lookup-war` | Find war/raid records for a team or player (paged). |
 
 ### Ticket commands
 
@@ -74,6 +78,12 @@ Two Google Sheet tabs are used inside one spreadsheet:
 5. Type `done` when finished — or just wait, and it auto-logs when the 2 minutes are up.
 6. The bot writes the row + posts the embed to the ban log channel, pinging senior
    staff if the severity is **HIGH / CRITICAL / PERMANENT**.
+
+> **Evidence is re-hosted, not linked.** Discord CDN links now expire after ~24h, so
+> the bot downloads each screenshot and **re-uploads** it as a permanent attachment
+> (optionally to a separate `EVIDENCE_ARCHIVE_CHANNEL_ID`). The sheet stores a
+> permanent Discord **message link** rather than a short-lived CDN URL, so ban
+> evidence never rots.
 
 ---
 
@@ -118,11 +128,15 @@ mc-ban-bot/
 ├── src/
 │   ├── index.js            # Bot entry point: routes slash commands + ticket buttons, evidence flow
 │   ├── deploy-commands.js  # Registers the slash commands with Discord (run once)
-│   ├── sheets.js           # All Google Sheets reads/writes + cell styling + auto-ID
-│   ├── tickets.js          # Ticket system: panel, categories, claim/close, transcripts, whitelist
+│   ├── sheets.js           # All Google Sheets reads/writes + cell styling + auto-ID + retry/backoff
+│   ├── tickets.js          # Ticket system: panel, categories, claim/close, transcripts, inactivity sweep
 │   ├── ai.js               # Claude-powered whitelist application review
-│   └── embeds.js           # Builds the Discord embeds (ban, war, appeal, lookups, tickets)
-├── data/                   # Runtime state (ticket counters + category IDs) — gitignored, auto-created
+│   ├── embeds.js           # Builds the Discord embeds (ban, war, appeal, lookups, banlist, stats, tickets)
+│   ├── duration.js         # Parses ban durations → computes expiry (pure, unit-tested)
+│   ├── banState.js         # Tracks lifted/unbanned bans in data/bans.json
+│   └── stats.js            # Pure aggregation for /stats (bans/wars summaries)
+├── test/                   # node --test unit tests for the pure helpers (run with `npm test`)
+├── data/                   # Runtime state (ticket counters/category IDs, unban records) — gitignored
 ├── credentials.json        # Google service-account key — NEVER commit (gitignored)
 ├── .env                    # Secrets — NEVER commit (gitignored)
 ├── .env.example            # Template showing which env vars are needed
@@ -167,12 +181,14 @@ Copy `.env.example` → `.env` and fill it in:
 ```env
 DISCORD_TOKEN=          # Bot token
 CLIENT_ID=              # Application ID
+GUILD_ID=               # Optional: register commands to one guild for instant updates (blank = global)
 
 # ── Branding (optional — rebrand without touching code) ──
 BRAND_NAME=SovietCraft  # Name shown across all embeds
 BRAND_COLOR=#5865f2     # Accent colour for panel / info embeds (hex)
 BRAND_ICON_URL=         # Optional icon for embed author/footer lines
 BAN_LOG_CHANNEL_ID=     # Channel where ban embeds are posted
+EVIDENCE_ARCHIVE_CHANNEL_ID=  # Optional: separate channel to re-host evidence (defaults to ban log)
 WAR_LOG_CHANNEL_ID=     # Channel where war/raid embeds are posted
 SENIOR_ROLE_IDS=        # Comma-separated role IDs to ping for HIGH/CRITICAL/PERMANENT bans + Staff Reports
 SPREADSHEET_ID=         # From the sheet URL: docs.google.com/spreadsheets/d/<THIS>/edit
@@ -183,6 +199,8 @@ WAR_SHEET_NAME=War & Raid Approvals
 STAFF_ROLE_IDS=         # Roles that can run every ticket / whitelist command (blank = Manage Server)
 TICKET_LOG_CHANNEL_ID=  # Channel where closed-ticket transcripts + summaries are posted
 STAFF_APP_MIN_DAYS=7    # Membership age (days) required to open a Staff Application
+TICKET_INACTIVITY_HOURS=0       # Auto-close tickets idle this many hours (0 = disabled)
+TICKET_INACTIVITY_WARN_HOURS=0  # Warn at this many idle hours before auto-close (0 = no warning)
 
 # ── Whitelist ──
 MEMBER_ROLE_ID=         # Role granted on whitelist approval (AI auto-approve or /wl-accept)
@@ -200,9 +218,12 @@ if you change the sheet's example/divider layout.
 npm install
 npm run deploy   # registers slash commands (run once, and again whenever commands change)
 npm start        # starts the bot
+npm test         # runs the unit tests (node --test) — no token/sheet needed
 ```
 
 > Re-run `npm run deploy` any time you add/remove/rename a command or its options.
+> Set `GUILD_ID` in `.env` during development so commands register to your test
+> server **instantly** (global registration can take up to ~1 hour to propagate).
 
 ---
 
@@ -241,7 +262,7 @@ A **control-panel, category-based** ticket system. Members click a button on a
 pinned panel; the bot opens a **private channel** for them inside that ticket
 type's own category. Staff manage it with slash commands and buttons.
 
-### The six ticket types
+### The seven ticket types
 
 | Type | Category | Notes |
 |------|----------|-------|
@@ -249,13 +270,14 @@ type's own category. Staff manage it with slash commands and buttons.
 | 🎫 General Support | own category | — |
 | ⚔️ War / Raid Request | own category | — |
 | 🚩 Member Report | own category | — |
+| ⚖️ Ban Appeal | own category | **Pings staff** when opened; a **🔍 Look Up Ban** button pulls the real ban record from the sheet into the ticket |
 | 🛡️ Staff Report | own category | **Pings senior staff** when opened |
 | 🪖 Staff Application | own category | **Blocked** unless the member has been in the server ≥ `STAFF_APP_MIN_DAYS` (default 7) |
 
 ### Setup (one command)
 
 Run **`/ticket-panel`** in the channel where you want the panel. On first run the
-bot **auto-creates the six categories** (hidden from `@everyone`, visible to staff)
+bot **auto-creates the seven categories** (hidden from `@everyone`, visible to staff)
 and posts the panel with one button per type. Re-running it just re-posts the panel;
 existing categories are reused.
 
@@ -277,6 +299,11 @@ existing categories are reused.
 3. **`/add` / `/remove`** grant or revoke access for extra users.
 4. **Closing** (button or `/close [reason]`) saves a full **text transcript** plus a
    summary embed to `TICKET_LOG_CHANNEL_ID`, then deletes the channel after 5s.
+
+> **Inactivity auto-close (opt-in).** Set `TICKET_INACTIVITY_HOURS` (and optionally
+> `TICKET_INACTIVITY_WARN_HOURS`) to have the bot warn, then auto-close, tickets that
+> go quiet. Idle time is measured from the last **human** message, so the bot's own
+> warning doesn't reset the clock. Both default to `0` (disabled).
 
 ### How state is stored
 
