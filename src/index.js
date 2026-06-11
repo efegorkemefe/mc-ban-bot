@@ -1,10 +1,16 @@
 require('dotenv').config();
 
-const { Client, GatewayIntentBits, Events, Collection, PermissionFlagsBits } = require('discord.js');
+const {
+  Client, GatewayIntentBits, Events, Collection, PermissionFlagsBits, AttachmentBuilder,
+  ActionRowBuilder, ButtonBuilder, ButtonStyle,
+} = require('discord.js');
 
 const sheets = require('./sheets');
 const tickets = require('./tickets');
 const ai = require('./ai');
+const banState = require('./banState');
+const stats = require('./stats');
+const { computeBanEnd } = require('./duration');
 const {
   buildBanEmbed,
   buildWarEmbed,
@@ -16,13 +22,27 @@ const {
   buildTicketUnclaimEmbed,
   buildTicketNoticeEmbed,
   buildWhitelistReviewEmbed,
-  buildHelpEmbed,
+  buildHelpPanelEmbed,
+  buildMemberGuideEmbed,
+  buildStaffGuideEmbed,
+  buildTicketRulesEmbed,
   buildStatusEmbed,
+  buildBanListEmbed,
+  buildUnbanEmbed,
+  buildStatsEmbed,
+  buildHistoryEmbed,
+  buildMyBansEmbed,
+  banListLine,
+  historyLine,
+  myBanLine,
 } = require('./embeds');
 
 // ── Config ──────────────────────────────────────────────────────────────────
 const BAN_LOG_CHANNEL_ID = process.env.BAN_LOG_CHANNEL_ID;
 const WAR_LOG_CHANNEL_ID = process.env.WAR_LOG_CHANNEL_ID;
+// Optional separate channel to archive ban evidence in. Falls back to the ban
+// log channel. Evidence is re-hosted here so the stored link never expires.
+const EVIDENCE_ARCHIVE_CHANNEL_ID = process.env.EVIDENCE_ARCHIVE_CHANNEL_ID || BAN_LOG_CHANNEL_ID;
 const SENIOR_ROLE_IDS = (process.env.SENIOR_ROLE_IDS || '')
   .split(',')
   .map(id => id.trim())
@@ -31,6 +51,11 @@ const SENIOR_ROLE_IDS = (process.env.SENIOR_ROLE_IDS || '')
 // Severities that trigger a senior-staff ping.
 const PING_SEVERITIES = new Set(['HIGH', 'CRITICAL', 'PERMANENT']);
 const EVIDENCE_WINDOW_MS = 2 * 60 * 1000;
+
+// Ticket inactivity auto-close (hours). 0 / unset disables the feature entirely.
+const INACTIVITY_CLOSE_HOURS = parseFloat(process.env.TICKET_INACTIVITY_HOURS || '0');
+const INACTIVITY_WARN_HOURS = parseFloat(process.env.TICKET_INACTIVITY_WARN_HOURS || '0');
+const INACTIVITY_SWEEP_MS = 30 * 60 * 1000; // scan every 30 minutes
 
 // ── Client ────────────────────────────────────────────────────────────────────
 const client = new Client({
@@ -43,6 +68,48 @@ const client = new Client({
 
 // In-memory evidence collection, keyed by userId. 2-minute expiry.
 const pendingEvidence = new Collection();
+
+// ── Paginated embed replies ─────────────────────────────────────────────────────
+// Holds an ordered list of pre-built embeds keyed by a short token; prev/next
+// buttons flip between them. Sessions expire after 10 minutes.
+const paginators = new Collection();
+const PAGINATOR_TTL_MS = 10 * 60 * 1000;
+
+function paginatorComponents(token, page, total) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`pg:${token}:prev`).setEmoji('◀').setStyle(ButtonStyle.Secondary).setDisabled(page === 0),
+    new ButtonBuilder().setCustomId('pg:noop:x').setLabel(`${page + 1} / ${total}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
+    new ButtonBuilder().setCustomId(`pg:${token}:next`).setEmoji('▶').setStyle(ButtonStyle.Secondary).setDisabled(page >= total - 1),
+  )];
+}
+
+// Sends an ephemeral reply that pages through `embeds`. Falls back to a plain
+// reply when there's only one page.
+async function replyPaginated(interaction, embeds, content) {
+  if (embeds.length <= 1) {
+    return interaction.editReply({ content, embeds });
+  }
+  const token = Math.random().toString(36).slice(2, 10);
+  const timeout = setTimeout(() => paginators.delete(token), PAGINATOR_TTL_MS);
+  paginators.set(token, { embeds, page: 0, content, timeout });
+  return interaction.editReply({ content, embeds: [embeds[0]], components: paginatorComponents(token, 0, embeds.length) });
+}
+
+async function handlePaginatorButton(interaction) {
+  const [, token, dir] = interaction.customId.split(':');
+  const session = paginators.get(token);
+  if (!session) {
+    return interaction.update({ content: '⏳ This list has expired — run the command again.', embeds: [], components: [] }).catch(() => {});
+  }
+  session.page = dir === 'next'
+    ? Math.min(session.embeds.length - 1, session.page + 1)
+    : Math.max(0, session.page - 1);
+  return interaction.update({
+    content: session.content,
+    embeds: [session.embeds[session.page]],
+    components: paginatorComponents(token, session.page, session.embeds.length),
+  });
+}
 
 function today() {
   return new Date().toISOString().split('T')[0]; // YYYY-MM-DD
@@ -59,6 +126,25 @@ client.once(Events.ClientReady, async c => {
       status: 'online',
     });
   } catch { /* non-fatal */ }
+
+  // Warm each guild's channel cache so duplicate-ticket detection
+  // (tickets.findAnyOpenTicketByUser / countOpenTickets) sees every channel
+  // right after boot. Gateway events keep the cache fresh afterwards.
+  for (const guild of c.guilds.cache.values()) {
+    await guild.channels.fetch().catch(() => {});
+  }
+
+  // Ticket inactivity auto-close (opt-in via env). Scans on a fixed interval.
+  if (INACTIVITY_CLOSE_HOURS > 0) {
+    console.log(`🧹 Inactivity auto-close enabled (warn ${INACTIVITY_WARN_HOURS || 'off'}h / close ${INACTIVITY_CLOSE_HOURS}h).`);
+    setInterval(() => {
+      for (const guild of client.guilds.cache.values()) {
+        tickets
+          .sweepInactiveTickets(guild, client, { warnHours: INACTIVITY_WARN_HOURS, closeHours: INACTIVITY_CLOSE_HOURS })
+          .catch(err => console.error('Inactivity sweep failed:', err));
+      }
+    }, INACTIVITY_SWEEP_MS);
+  }
 
   await reportStartupConfig(c);
 });
@@ -101,6 +187,8 @@ client.on(Events.InteractionCreate, async interaction => {
   try {
     if (interaction.isButton()) {
       if (interaction.customId.startsWith('ticket:')) return await handleTicketButton(interaction);
+      if (interaction.customId.startsWith('pg:')) return await handlePaginatorButton(interaction);
+      if (interaction.customId.startsWith('help:')) return await handleHelpButton(interaction);
       return;
     }
 
@@ -110,6 +198,11 @@ client.on(Events.InteractionCreate, async interaction => {
       case 'log-ban':       return await handleLogBan(interaction);
       case 'update-appeal': return await handleUpdateAppeal(interaction);
       case 'lookup-ban':    return await handleLookupBan(interaction);
+      case 'findban':       return await handleFindBan(interaction);
+      case 'banlist':       return await handleBanList(interaction);
+      case 'unban':         return await handleUnban(interaction);
+      case 'stats':         return await handleStats(interaction);
+      case 'history':       return await handleHistory(interaction);
       case 'log-war':       return await handleLogWar(interaction);
       case 'lookup-war':    return await handleLookupWar(interaction);
       // ── Ticket commands ──
@@ -122,6 +215,7 @@ client.on(Events.InteractionCreate, async interaction => {
       case 'close':         return await handleTicketClose(interaction);
       case 'wl-accept':     return await handleWlAccept(interaction);
       case 'help':          return await handleHelp(interaction);
+      case 'help-panel':    return await handleHelpPanel(interaction);
       case 'ping':          return await handlePing(interaction);
     }
   } catch (err) {
@@ -230,6 +324,10 @@ async function handleTicketButton(interaction) {
 
   if (id === 'ticket:wlappeal') {
     return await handleWhitelistAppeal(interaction, meta);
+  }
+
+  if (id === 'ticket:lookupban') {
+    return await handleBanAppealLookup(interaction, meta);
   }
 
   if (id === 'ticket:close') {
@@ -363,6 +461,64 @@ async function handleWhitelistAppeal(interaction, meta) {
     allowedMentions: { roles: roleIds },
   });
   return interaction.editReply('📣 Your appeal has been submitted — staff have been notified and will review your application.');
+}
+
+// ── Ban Appeal: Look Up Ban (attach the record + notify staff) ──────────────────
+// Pulls a ban-ID-looking token out of the applicant's messages, prefering an
+// explicit "Ban ID: NNN" over a loose number so ages/years aren't mistaken for it.
+function extractBanId(text) {
+  if (!text) return null;
+  const patterns = [/ban\s*id:?\s*(\d{1,5})/i, /\bid:?\s*(\d{1,5})/i, /#?\b(\d{1,5})\b/];
+  for (const re of patterns) {
+    const m = re.exec(text);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+async function handleBanAppealLookup(interaction, meta) {
+  if (meta.type !== 'ban_appeal') {
+    return interaction.reply({ content: '❌ This button only works in a ban appeal ticket.', ephemeral: true });
+  }
+  if (interaction.user.id !== meta.ownerId && !tickets.isStaff(interaction.member)) {
+    return interaction.reply({ content: '❌ Only the person appealing can look up their ban.', ephemeral: true });
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  const text = await tickets.collectApplicationText(interaction.channel, meta.ownerId);
+  const banId = extractBanId(text);
+  if (!banId) {
+    return interaction.editReply('⚠️ Please type the **Ban ID** you are appealing (e.g. `004`) in this channel first, then click **Look Up Ban** again.');
+  }
+
+  const found = await withTimeout(sheets.findBanById(banId)).catch(() => null);
+  if (!found) {
+    return interaction.editReply(`❌ I couldn't find a ban with ID \`${banId}\`. Double-check the ID and try again.`);
+  }
+
+  const ban = sheets.rowToBan(found.rowData);
+  const unban = banState.getUnban(ban.ban_id);
+  const roleIds = tickets.staffPingRoleIds();
+
+  await interaction.channel.send({
+    content: roleIds.map(r => `<@&${r}>`).join(' ') || undefined,
+    embeds: [buildBanLookupEmbed(ban, { unban })],
+    allowedMentions: { roles: roleIds },
+  });
+
+  if (String(ban.appeal_status).toLowerCase().includes('unappeal')) {
+    await interaction.channel.send({
+      embeds: [buildTicketNoticeEmbed({
+        title: 'Heads up — marked Unappealable',
+        description: `Ban \`ID: ${sheets.normalizeBanId(ban.ban_id)}\` was logged as **Unappealable**. Staff can still review, but approval is unlikely.`,
+        color: 0xf0a500,
+        emoji: '⚠️',
+      })],
+    });
+  }
+
+  return interaction.editReply('✅ Your ban record has been posted above and staff have been notified.');
 }
 
 // ── /wl-accept ──────────────────────────────────────────────────────────────────
@@ -536,7 +692,7 @@ async function handleLogBan(interaction) {
     banData,
     interaction,
     channelId: interaction.channelId,
-    evidenceUrls: [],
+    evidenceFiles: [], // { buffer, ext } — downloaded while the CDN URL is fresh
     expiresAt: Date.now() + EVIDENCE_WINDOW_MS,
     timeout,
   });
@@ -560,6 +716,29 @@ async function safeDelete(message) {
   }
 }
 
+// Downloads an attachment to a Buffer while its (short-lived) CDN URL is still
+// valid, so it can be re-hosted permanently later. Returns null on failure.
+async function downloadEvidence(attachment) {
+  try {
+    const res = await fetch(attachment.url);
+    if (!res.ok) {
+      console.warn('Evidence download failed with HTTP', res.status);
+      return null;
+    }
+    return Buffer.from(await res.arrayBuffer());
+  } catch (err) {
+    console.warn('Could not download evidence attachment:', err.message);
+    return null;
+  }
+}
+
+// Derives a safe file extension from an attachment's name or content type.
+function evidenceExt(attachment) {
+  const m = /\.([a-z0-9]+)$/i.exec(attachment.name || '');
+  if (m) return `.${m[1].toLowerCase()}`;
+  return `.${(attachment.contentType?.split('/')[1] || 'png')}`;
+}
+
 // Writes the ban to the sheet, posts the embed to the log channel, and clears
 // the pending state. Called from both the "done"/upload path and the timeout.
 async function finalizeBan(userId, { reason } = {}) {
@@ -568,10 +747,10 @@ async function finalizeBan(userId, { reason } = {}) {
   if (pending.timeout) clearTimeout(pending.timeout);
   pendingEvidence.delete(userId);
 
-  const { banData, evidenceUrls, interaction } = pending;
+  const { banData, evidenceFiles, interaction } = pending;
 
   // Timeout with nothing uploaded → tell the user and bail.
-  if (reason === 'timeout' && evidenceUrls.length === 0) {
+  if (reason === 'timeout' && evidenceFiles.length === 0) {
     await interaction
       .editReply('⏰ Evidence window closed with no screenshots uploaded. Run `/log-ban` again to retry.')
       .catch(() => {});
@@ -579,11 +758,19 @@ async function finalizeBan(userId, { reason } = {}) {
   }
 
   try {
-    const banId = await sheets.appendBan(banData, evidenceUrls);
+    // Write the row first to assign the ban ID; the permanent evidence link is
+    // filled in (column G) after we post the screenshots below.
+    const banId = await withTimeout(sheets.appendBan(banData, []), 15000);
 
     const formatted = { ...banData, ban_id: banId };
-    const banEmbed = buildBanEmbed(formatted, evidenceUrls, `<@${banData.staff_id}>`);
 
+    // Re-host the screenshots as message attachments so their links never expire.
+    const files = evidenceFiles.map((f, i) => new AttachmentBuilder(f.buffer, { name: `evidence-${i + 1}${f.ext}` }));
+    const imageRef = files.length ? `attachment://${files[0].name}` : null;
+
+    const banEmbed = buildBanEmbed(formatted, { imageUrl: imageRef, count: files.length }, `<@${banData.staff_id}>`);
+
+    let evidenceLink = '';
     const channel = await client.channels.fetch(BAN_LOG_CHANNEL_ID).catch(() => null);
     if (!channel) {
       console.error('❌ Could not fetch BAN_LOG_CHANNEL_ID:', BAN_LOG_CHANNEL_ID);
@@ -592,15 +779,40 @@ async function finalizeBan(userId, { reason } = {}) {
       const content = shouldPing && SENIOR_ROLE_IDS.length
         ? `${SENIOR_ROLE_IDS.map(id => `<@&${id}>`).join(' ')} — **${banData.severity}** severity ban logged.`
         : undefined;
-      await channel.send({
+      // Attaching the files to the log message keeps the embed's inline preview permanent.
+      const banLogMsg = await channel.send({
         content,
         embeds: [banEmbed],
+        files,
         allowedMentions: { roles: SENIOR_ROLE_IDS },
       });
+
+      // Determine the permanent evidence link to store in the sheet. If a
+      // dedicated archive channel is configured, re-host there; otherwise link
+      // back to the log message itself.
+      if (files.length) {
+        if (EVIDENCE_ARCHIVE_CHANNEL_ID && EVIDENCE_ARCHIVE_CHANNEL_ID !== BAN_LOG_CHANNEL_ID) {
+          const archive = await client.channels.fetch(EVIDENCE_ARCHIVE_CHANNEL_ID).catch(() => null);
+          if (archive) {
+            const archiveFiles = evidenceFiles.map((f, i) => new AttachmentBuilder(f.buffer, { name: `evidence-${i + 1}${f.ext}` }));
+            const archiveMsg = await archive
+              .send({ content: `📎 Evidence for ban \`${formatted.ban_id}\` — **${banData.player_banned}**`, files: archiveFiles })
+              .catch(err => { console.error('Failed to archive evidence:', err); return null; });
+            if (archiveMsg) evidenceLink = archiveMsg.url;
+          }
+        }
+        if (!evidenceLink) evidenceLink = banLogMsg.url;
+      }
+    }
+
+    // Persist the permanent link (best-effort — the ban itself is already logged).
+    if (evidenceLink) {
+      await withTimeout(sheets.updateEvidence(formatted.ban_id, evidenceLink), 15000)
+        .catch(err => console.error('Failed to store evidence link:', err));
     }
 
     await interaction
-      .editReply(`✅ Ban \`${formatted.ban_id}\` logged with ${evidenceUrls.length} screenshot(s) and posted.`)
+      .editReply(`✅ Ban \`${formatted.ban_id}\` logged with ${evidenceFiles.length} screenshot(s) and posted.`)
       .catch(() => {});
   } catch (err) {
     console.error('Error logging ban:', err);
@@ -621,28 +833,32 @@ client.on(Events.MessageCreate, async message => {
   if (!pending) return;
   if (message.channelId !== pending.channelId) return;
 
-  const imageUrls = [...message.attachments.values()]
-    .filter(a => a.contentType?.startsWith('image/'))
-    .map(a => a.url);
+  const imageAttachments = [...message.attachments.values()]
+    .filter(a => a.contentType?.startsWith('image/'));
   const isDone = message.content.trim().toLowerCase() === 'done';
 
-  if (imageUrls.length === 0 && !isDone) return; // ignore unrelated chatter
+  if (imageAttachments.length === 0 && !isDone) return; // ignore unrelated chatter
 
   // Auto-delete the submission to keep the channel clean.
   await safeDelete(message);
 
-  if (imageUrls.length > 0) {
-    pending.evidenceUrls.push(...imageUrls);
+  if (imageAttachments.length > 0) {
+    // Download now, while the CDN URLs are still valid, so we can re-host them
+    // permanently when the ban is finalized.
+    for (const att of imageAttachments) {
+      const buffer = await downloadEvidence(att);
+      if (buffer) pending.evidenceFiles.push({ buffer, ext: evidenceExt(att) });
+    }
     await pending.interaction
       .editReply(
-        `📎 Collected **${pending.evidenceUrls.length}** screenshot(s). ` +
+        `📎 Collected **${pending.evidenceFiles.length}** screenshot(s). ` +
         `Upload more or type \`done\` to finish.`,
       )
       .catch(() => {});
   }
 
   if (isDone) {
-    if (pending.evidenceUrls.length === 0) {
+    if (pending.evidenceFiles.length === 0) {
       await pending.interaction
         .editReply('⚠️ Please upload at least one screenshot before typing `done`.')
         .catch(() => {});
@@ -659,7 +875,7 @@ async function handleUpdateAppeal(interaction) {
 
   await interaction.deferReply({ ephemeral: true });
 
-  const updated = await sheets.updateAppealStatus(banId, status);
+  const updated = await withTimeout(sheets.updateAppealStatus(banId, status), 15000);
   if (!updated) {
     await interaction.editReply(`❌ Ban \`ID: ${sheets.normalizeBanId(banId)}\` not found in the sheet.`);
     return;
@@ -678,24 +894,159 @@ async function handleLookupBan(interaction) {
   const query = interaction.options.getString('query');
   await interaction.deferReply({ ephemeral: true });
 
-  const byId = await sheets.findBanById(query);
+  const byId = await withTimeout(sheets.findBanById(query));
   if (byId) {
-    await interaction.editReply({ embeds: [buildBanLookupEmbed(sheets.rowToBan(byId.rowData))] });
+    const ban = sheets.rowToBan(byId.rowData);
+    await interaction.editReply({ embeds: [buildBanLookupEmbed(ban, { unban: banState.getUnban(ban.ban_id) })] });
     return;
   }
 
-  const matches = await sheets.findBansByPlayer(query);
+  const matches = await withTimeout(sheets.findBansByPlayer(query));
   if (matches.length === 0) {
     await interaction.editReply(`❌ No bans found for \`${query}\`.`);
     return;
   }
 
-  // Up to 3 most recent (rows are oldest-first, so take the tail and reverse).
-  const embeds = matches.slice(-3).reverse().map(m => buildBanLookupEmbed(sheets.rowToBan(m.rowData)));
-  await interaction.editReply({
-    content: `Found **${matches.length}** ban(s) for \`${query}\` — showing the ${embeds.length} most recent:`,
-    embeds,
+  // Newest first, one embed per ban, paged through with buttons.
+  const embeds = matches.slice().reverse().map(m => {
+    const ban = sheets.rowToBan(m.rowData);
+    return buildBanLookupEmbed(ban, { unban: banState.getUnban(ban.ban_id) });
   });
+  await replyPaginated(interaction, embeds, `Found **${matches.length}** ban(s) for \`${query}\`:`);
+}
+
+// ── /findban (public: a player looks up their own Ban ID to give to staff) ───────
+async function handleFindBan(interaction) {
+  const username = interaction.options.getString('username');
+  await interaction.deferReply({ ephemeral: true });
+
+  const matches = await withTimeout(sheets.findBansByPlayer(username));
+  if (matches.length === 0) {
+    return interaction.editReply(
+      `✅ No bans found for \`${username}\`. If you think this is wrong, make sure you typed your **exact** in-game name.`,
+    );
+  }
+
+  // Newest first; cap at 15 lines so the embed description stays within limits.
+  const bans = matches.slice().reverse().map(m => sheets.rowToBan(m.rowData)).slice(0, 15);
+  let anyActive = false;
+  const lines = bans.map(b => {
+    const lifted = banState.isUnbanned(b.ban_id);
+    if (!lifted && computeBanEnd(b.date, b.duration).state !== 'ended') anyActive = true;
+    return myBanLine(b, { lifted });
+  });
+
+  return interaction.editReply({ embeds: [buildMyBansEmbed({ username, lines, anyActive })] });
+}
+
+// ── /banlist ────────────────────────────────────────────────────────────────────
+async function handleBanList(interaction) {
+  const scope = interaction.options.getString('scope') || 'active';
+  await interaction.deferReply({ ephemeral: true });
+
+  const rows = await withTimeout(sheets.getBanRecords());
+  let bans = rows.map(sheets.rowToBan).filter(b => sheets.normalizeBanId(b.ban_id));
+
+  if (scope === 'active') {
+    bans = bans.filter(b => !banState.isUnbanned(b.ban_id) && computeBanEnd(b.date, b.duration).state !== 'ended');
+  }
+
+  if (bans.length === 0) {
+    await interaction.editReply(scope === 'active' ? '✅ There are no active bans right now.' : '❌ No bans found.');
+    return;
+  }
+
+  // Newest first; compact lines paged at 15 per embed.
+  bans.reverse();
+  const lines = bans.map(b => banListLine(b, { lifted: banState.isUnbanned(b.ban_id) }));
+
+  const PER_PAGE = 15;
+  const total = bans.length;
+  const totalPages = Math.ceil(lines.length / PER_PAGE);
+  const embeds = [];
+  for (let i = 0; i < lines.length; i += PER_PAGE) {
+    embeds.push(buildBanListEmbed({ lines: lines.slice(i, i + PER_PAGE), page: embeds.length, totalPages, total, scope }));
+  }
+
+  await replyPaginated(interaction, embeds);
+}
+
+// ── /unban ──────────────────────────────────────────────────────────────────────
+async function handleUnban(interaction) {
+  if (!tickets.isStaff(interaction.member)) {
+    return interaction.reply({ content: '❌ Only staff can lift bans.', ephemeral: true });
+  }
+  const banId = interaction.options.getString('ban_id');
+  const reason = interaction.options.getString('reason') || '';
+  await interaction.deferReply({ ephemeral: true });
+
+  const found = await withTimeout(sheets.findBanById(banId));
+  if (!found) {
+    return interaction.editReply(`❌ Ban \`ID: ${sheets.normalizeBanId(banId)}\` not found in the sheet.`);
+  }
+  if (banState.isUnbanned(banId)) {
+    return interaction.editReply(`ℹ️ Ban \`ID: ${sheets.normalizeBanId(banId)}\` is already marked as lifted.`);
+  }
+
+  const ban = sheets.rowToBan(found.rowData);
+  banState.setUnban(banId, { at: new Date().toISOString(), by: interaction.user.id, reason });
+
+  const embed = buildUnbanEmbed({ banId, player: ban.player_banned, byMention: `<@${interaction.user.id}>`, reason });
+  const channel = await client.channels.fetch(BAN_LOG_CHANNEL_ID).catch(() => null);
+  if (channel) await channel.send({ embeds: [embed] });
+
+  return interaction.editReply({ embeds: [embed] });
+}
+
+// ── /stats ────────────────────────────────────────────────────────────────────
+async function handleStats(interaction) {
+  await interaction.deferReply({ ephemeral: true });
+
+  const [banRows, warRows] = await Promise.all([
+    withTimeout(sheets.getBanRecords()),
+    withTimeout(sheets.getWarRows()),
+  ]);
+
+  const bans = stats.summarizeBans(
+    banRows.map(sheets.rowToBan).filter(b => sheets.normalizeBanId(b.ban_id)),
+    banState.isUnbanned,
+  );
+  const wars = stats.summarizeWars(warRows.map(sheets.rowToWar));
+  const openTickets = interaction.guild ? tickets.countOpenTickets(interaction.guild) : 0;
+
+  return interaction.editReply({ embeds: [buildStatsEmbed({ bans, wars, openTickets })] });
+}
+
+// ── /history ────────────────────────────────────────────────────────────────────
+async function handleHistory(interaction) {
+  const player = interaction.options.getString('player');
+  await interaction.deferReply({ ephemeral: true });
+
+  const matches = await withTimeout(sheets.findBansByPlayer(player));
+  if (matches.length === 0) {
+    return interaction.editReply(`✅ No bans on record for \`${player}\` — clean slate.`);
+  }
+
+  // Newest first; track how many are still active for the header/colour.
+  const bans = matches.slice().reverse().map(m => sheets.rowToBan(m.rowData));
+  let activeCount = 0;
+  const lines = bans.map(b => {
+    const lifted = banState.isUnbanned(b.ban_id);
+    if (!lifted && computeBanEnd(b.date, b.duration).state !== 'ended') activeCount++;
+    return historyLine(b, { lifted });
+  });
+
+  const PER_PAGE = 12;
+  const total = bans.length;
+  const totalPages = Math.ceil(lines.length / PER_PAGE);
+  const embeds = [];
+  for (let i = 0; i < lines.length; i += PER_PAGE) {
+    embeds.push(buildHistoryEmbed({
+      player, lines: lines.slice(i, i + PER_PAGE), page: embeds.length, totalPages, total, activeCount,
+    }));
+  }
+
+  return replyPaginated(interaction, embeds);
 }
 
 // ── /log-war ────────────────────────────────────────────────────────────────
@@ -715,7 +1066,7 @@ async function handleLogWar(interaction) {
     approved_by:     interaction.member?.displayName || interaction.user.username,
   };
 
-  await sheets.appendWar(warData);
+  await withTimeout(sheets.appendWar(warData), 15000);
 
   const embed = buildWarEmbed(warData, `<@${interaction.user.id}>`);
 
@@ -735,23 +1086,49 @@ async function handleLookupWar(interaction) {
   const team = interaction.options.getString('team');
   await interaction.deferReply({ ephemeral: true });
 
-  const matches = await sheets.findWarsByTeam(team);
+  const matches = await withTimeout(sheets.findWarsByTeam(team));
   if (matches.length === 0) {
     await interaction.editReply(`❌ No war/raid records found for \`${team}\`.`);
     return;
   }
 
-  const embeds = matches.slice(-3).reverse().map(m => buildWarLookupEmbed(sheets.rowToWar(m.rowData)));
-  await interaction.editReply({
-    content: `Found **${matches.length}** record(s) for \`${team}\` — showing the ${embeds.length} most recent:`,
-    embeds,
-  });
+  const embeds = matches.slice().reverse().map(m => buildWarLookupEmbed(sheets.rowToWar(m.rowData)));
+  await replyPaginated(interaction, embeds, `Found **${matches.length}** record(s) for \`${team}\`:`);
 }
 
-// ── /help ─────────────────────────────────────────────────────────────────────
+// ── Help Center (/help, /help-panel) ────────────────────────────────────────────
+// The three guide buttons shown on the help panel.
+function helpPanelComponents() {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('help:member').setLabel('Member Guide').setEmoji('📖').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('help:staff').setLabel('Staff Guide').setEmoji('🛠️').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('help:rules').setLabel('Ticket Rules').setEmoji('🎫').setStyle(ButtonStyle.Secondary),
+  )];
+}
+
+// /help — show the help center to the person who ran it (ephemeral).
 async function handleHelp(interaction) {
-  const staff = tickets.isStaff(interaction.member);
-  return interaction.reply({ embeds: [buildHelpEmbed({ isStaff: staff })], ephemeral: true });
+  return interaction.reply({ embeds: [buildHelpPanelEmbed()], components: helpPanelComponents(), ephemeral: true });
+}
+
+// /help-panel — admins post the help center publicly in the current channel.
+async function handleHelpPanel(interaction) {
+  if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+    return interaction.reply({ content: '❌ You need the **Manage Server** permission to post the help panel.', ephemeral: true });
+  }
+  await interaction.deferReply({ ephemeral: true });
+  await interaction.channel.send({ embeds: [buildHelpPanelEmbed()], components: helpPanelComponents() });
+  return interaction.editReply('✅ Help panel posted.');
+}
+
+// Guide buttons → reply privately with the chosen tutorial (works on both the
+// public panel and the ephemeral /help message).
+async function handleHelpButton(interaction) {
+  const which = interaction.customId.split(':')[1];
+  const embed = which === 'staff' ? buildStaffGuideEmbed()
+    : which === 'rules' ? buildTicketRulesEmbed()
+      : buildMemberGuideEmbed();
+  return interaction.reply({ embeds: [embed], ephemeral: true });
 }
 
 // ── /ping ─────────────────────────────────────────────────────────────────────
@@ -777,6 +1154,16 @@ async function handlePing(interaction) {
     ephemeral: true,
   });
 }
+
+// ── Process-level safety net ────────────────────────────────────────────────────
+// A stray rejection or thrown error in an event handler should be logged, not
+// allowed to silently crash the bot.
+process.on('unhandledRejection', err => {
+  console.error('Unhandled promise rejection:', err);
+});
+process.on('uncaughtException', err => {
+  console.error('Uncaught exception:', err);
+});
 
 // ── Login ─────────────────────────────────────────────────────────────────────
 client.login(process.env.DISCORD_TOKEN);

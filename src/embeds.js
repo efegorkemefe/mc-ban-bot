@@ -1,5 +1,6 @@
 const { EmbedBuilder } = require('discord.js');
 const { normalizeBanId } = require('./sheets');
+const { computeBanEnd } = require('./duration');
 
 // ── Branding (configurable via .env) ────────────────────────────────────────────
 // Lets server owners rebrand the bot without touching code.
@@ -71,21 +72,84 @@ function parseEvidence(value) {
   return String(value).split(/[\n,]+/).map(u => u.trim()).filter(Boolean);
 }
 
-function applyEvidence(embed, urls) {
-  if (urls.length === 0) {
+// Renders the evidence field. `urls` are clickable links (e.g. a permanent
+// archive-message link, or per-screenshot URLs); `imageUrl` is what to render
+// inline (an `attachment://name` reference keeps the preview permanent); `count`
+// overrides the displayed screenshot count when the files are attached to the
+// message rather than linked.
+function applyEvidence(embed, { urls = [], imageUrl = null, count = null } = {}) {
+  const n = count != null ? count : urls.length;
+  if (n === 0) {
     embed.addFields({ name: '📎 Evidence', value: '`none attached`' });
     return;
   }
-  embed.setImage(urls[0]);
-  const lines = urls.map((u, i) => `[Screenshot ${i + 1}](${u})`).join('  ·  ');
-  embed.addFields({ name: `📎 Evidence (${urls.length})`, value: lines });
+  if (imageUrl) embed.setImage(imageUrl);
+  else if (urls.length) embed.setImage(urls[0]);
+
+  const value = urls.length
+    ? urls.map((u, i) => `[Screenshot ${i + 1}](${u})`).join('  ·  ')
+    : `\`${n}\` screenshot(s) attached above`;
+  embed.addFields({ name: `📎 Evidence (${n})`, value });
 }
 
 // A blank inline field to keep the 3-column grid aligned.
 const spacer = () => ({ name: ZWSP, value: ZWSP, inline: true });
 
+// ── Ban expiry helpers ──────────────────────────────────────────────────────────
+// Turn a ban's date + duration into a human "when does it end" string using
+// Discord's auto-localizing timestamps (<t:unix:…>).
+function banEndValue(ban) {
+  const info = computeBanEnd(ban.date, ban.duration);
+  if (info.state === 'permanent') return '🔒 Never · permanent';
+  if (info.state === 'unknown') return '`—`';
+  const sec = Math.floor(info.endMs / 1000);
+  return info.state === 'ended'
+    ? `<t:${sec}:D> · ✅ expired`
+    : `<t:${sec}:D> (<t:${sec}:R>)`;
+}
+
+// Compact one-liner variant for list views.
+function banEndShort(ban) {
+  const info = computeBanEnd(ban.date, ban.duration);
+  if (info.state === 'permanent') return '🔒 permanent';
+  if (info.state === 'unknown') return '';
+  const sec = Math.floor(info.endMs / 1000);
+  return info.state === 'ended' ? '✅ expired' : `ends <t:${sec}:R>`;
+}
+
+const inlineEnds = ban => ({ name: '⌛ Ends', value: banEndValue(ban), inline: true });
+
+// One compact line for /banlist: "🔴 `004` **Player** · ends in 3 days · 🔓 lifted".
+function banListLine(ban, { lifted = false } = {}) {
+  const id = normalizeBanId(ban.ban_id);
+  const sev = SEVERITY_EMOJI[up(ban.severity)] ?? '⚪';
+  const ends = banEndShort(ban);
+  return `${sev} \`${id || '—'}\` **${ban.player_banned || 'Unknown'}**` +
+    (ends ? ` · ${ends}` : '') + (lifted ? ' · 🔓 lifted' : '');
+}
+
+// One line for /history: "`2026-06-01` 🟠 **offense** · `ID 004` · ends in 3d · 🔓 lifted".
+function historyLine(ban, { lifted = false } = {}) {
+  const id = normalizeBanId(ban.ban_id);
+  const sev = SEVERITY_EMOJI[up(ban.severity)] ?? '⚪';
+  const offense = (ban.offense || '—').slice(0, 80);
+  const ends = banEndShort(ban);
+  return `\`${ban.date || '—'}\` ${sev} **${offense}** · \`ID ${id || '—'}\`` +
+    (ends ? ` · ${ends}` : '') + (lifted ? ' · 🔓 lifted' : '');
+}
+
+// Player-facing line for /findban — leads with the Ban ID they hand to staff,
+// and omits internal details (staff member, evidence).
+function myBanLine(ban, { lifted = false } = {}) {
+  const id = normalizeBanId(ban.ban_id);
+  const sev = SEVERITY_EMOJI[up(ban.severity)] ?? '⚪';
+  const status = lifted ? '🔓 lifted' : (banEndShort(ban) || '🔴 active');
+  return `**Ban ID: \`${id || '—'}\`** — ${sev} ${up(ban.severity) || '—'} · \`${ban.date || '—'}\` · ${status} · 📂 ${appealLabel(ban.appeal_status)}`;
+}
+
 // ── Ban embed ─────────────────────────────────────────────────────────────────
-function buildBanEmbed(data, evidenceUrls = [], staffMention) {
+// `evidence` is the options object passed to applyEvidence ({ urls, imageUrl, count }).
+function buildBanEmbed(data, evidence = {}, staffMention) {
   const id = normalizeBanId(data.ban_id);
   const embed = new EmbedBuilder()
     .setColor(severityColor(data.severity))
@@ -101,12 +165,14 @@ function buildBanEmbed(data, evidenceUrls = [], staffMention) {
       { name: '📅 Date',     value: `\`${data.date || '—'}\``, inline: true },
       { name: '📂 Appeal',   value: appealLabel(data.appeal_status), inline: true },
 
+      inlineEnds(data), spacer(), spacer(),
+
       { name: '📋 Offense',  value: data.offense || '—', inline: false },
     )
     .setFooter({ text: `${BRAND} • Ban ID: ${id}` })
     .setTimestamp();
 
-  applyEvidence(embed, evidenceUrls);
+  applyEvidence(embed, evidence);
   return embed;
 }
 
@@ -159,10 +225,11 @@ function buildAppealUpdateEmbed(banId, newStatus) {
 }
 
 // ── Lookup embeds ─────────────────────────────────────────────────────────────
-function buildBanLookupEmbed(ban) {
+// `opts.unban` (if the ban has been lifted) = { at, by, reason }.
+function buildBanLookupEmbed(ban, { unban = null } = {}) {
   const id = normalizeBanId(ban.ban_id);
   const embed = new EmbedBuilder()
-    .setColor(severityColor(ban.severity))
+    .setColor(unban ? NEUTRAL : severityColor(ban.severity))
     .setAuthor({ name: `🔍 ${BRAND} · Ban Record` })
     .setTitle(`Ban Record — ID: ${id}`)
     .addFields(
@@ -174,13 +241,83 @@ function buildBanLookupEmbed(ban) {
       { name: '📅 Date',     value: `\`${ban.date || '—'}\``, inline: true },
       { name: '📂 Appeal',   value: appealLabel(ban.appeal_status), inline: true },
 
+      inlineEnds(ban), spacer(), spacer(),
+
       { name: '📋 Offense',  value: ban.offense || '—', inline: false },
+    );
+
+  if (unban) {
+    const when = unban.at ? `<t:${Math.floor(Date.parse(unban.at) / 1000)}:R>` : '';
+    embed.addFields({
+      name: '🔓 Status',
+      value: `**Lifted** ${when}${unban.by ? ` by <@${unban.by}>` : ''}` +
+        (unban.reason ? `\n> ${unban.reason}` : ''),
+      inline: false,
+    });
+  }
+
+  embed.setFooter({ text: `${BRAND} • Ban ID: ${id}` }).setTimestamp();
+  applyEvidence(embed, { urls: parseEvidence(ban.evidence) });
+  return embed;
+}
+
+// ── /banlist (compact) ──────────────────────────────────────────────────────────
+// `lines` is a page's worth of pre-formatted strings; paging metadata controls
+// the title/footer. Built by the caller from rowToBan + banEndShort.
+function buildBanListEmbed({ lines, page = 0, totalPages = 1, total = 0, scope = 'active' }) {
+  return new EmbedBuilder()
+    .setColor(BRAND_COLOR)
+    .setAuthor(brandAuthor(`📋 ${BRAND_NAME} · Ban List`))
+    .setTitle(scope === 'active' ? `Currently Banned — ${total}` : `All Bans — ${total}`)
+    .setDescription(lines.length ? lines.join('\n') : '_No bans to show._')
+    .setFooter(brandFooter(`${BRAND_NAME} • Page ${page + 1}/${totalPages}`))
+    .setTimestamp();
+}
+
+// ── /history (per-player ban timeline) ──────────────────────────────────────────
+function buildHistoryEmbed({ player, lines, page = 0, totalPages = 1, total = 0, activeCount = 0 }) {
+  return new EmbedBuilder()
+    .setColor(activeCount > 0 ? 0xe84343 : NEUTRAL)
+    .setAuthor(brandAuthor(`📜 ${BRAND_NAME} · Player History`))
+    .setTitle(`History — ${player}`)
+    .setDescription(
+      `**${total}** ban(s) on record · **${activeCount}** active.\n\n` +
+      (lines.length ? lines.join('\n') : '_No bans on record._'),
+    )
+    .setFooter(brandFooter(`${BRAND_NAME} • Page ${page + 1}/${totalPages}`))
+    .setTimestamp();
+}
+
+// ── /findban (player self-service: "what's my ban ID?") ─────────────────────────
+function buildMyBansEmbed({ username, lines, anyActive }) {
+  return new EmbedBuilder()
+    .setColor(anyActive ? 0xe84343 : NEUTRAL)
+    .setAuthor(brandAuthor(`🔎 ${BRAND_NAME} · Ban Lookup`))
+    .setTitle(`Ban record for ${username}`)
+    .setDescription(
+      `Found **${lines.length}** ban(s) for **${username}**.\n\n` +
+      lines.join('\n') +
+      '\n\n**To appeal:** open a **⚖️ Ban Appeal** ticket from the ticket panel and give staff the **Ban ID** shown above.',
+    )
+    .setFooter(brandFooter(BRAND_NAME))
+    .setTimestamp();
+}
+
+// Posted to the ban log when a ban is lifted via /unban.
+function buildUnbanEmbed({ banId, player, byMention, reason }) {
+  const id = normalizeBanId(banId);
+  return new EmbedBuilder()
+    .setColor(0x57c454)
+    .setAuthor({ name: `🔓 ${BRAND} · Ban Lifted` })
+    .setTitle(`Ban Lifted — ID: ${id}`)
+    .setDescription(`**${player || 'Player'}**'s ban has been lifted by ${byMention}.`)
+    .addFields(
+      { name: '🆔 Ban ID', value: `\`ID: ${id}\``, inline: true },
+      { name: '🔓 Action', value: 'Unbanned', inline: true },
+      ...(reason ? [{ name: '📋 Reason', value: reason, inline: false }] : []),
     )
     .setFooter({ text: `${BRAND} • Ban ID: ${id}` })
     .setTimestamp();
-
-  applyEvidence(embed, parseEvidence(ban.evidence));
-  return embed;
 }
 
 function buildWarLookupEmbed(war) {
@@ -388,55 +525,219 @@ function buildTicketCloseLogEmbed(info) {
   return embed;
 }
 
-// ── /help ───────────────────────────────────────────────────────────────────────
-function buildHelpEmbed({ isStaff }) {
-  const embed = new EmbedBuilder()
+// Inactivity warning posted in a ticket before it is auto-closed.
+function buildTicketInactivityEmbed({ idleHours, closeHours }) {
+  const remaining = Math.max(1, Math.round(closeHours - idleHours));
+  return new EmbedBuilder()
+    .setColor(0xf0a500)
+    .setAuthor(brandAuthor(`💤 ${TICKET_BRAND} · Inactivity Notice`))
+    .setTitle('This ticket has gone quiet')
+    .setDescription(
+      `There's been no activity for about **${idleHours}h**. If nobody responds, this ticket ` +
+      `will be **automatically closed in ~${remaining}h**. Send a message to keep it open.`,
+    )
+    .setFooter(brandFooter(TICKET_BRAND))
+    .setTimestamp();
+}
+
+// ── Help Center ─────────────────────────────────────────────────────────────────
+// The landing panel (posted by /help-panel or shown by /help). The buttons that
+// open each guide are built in src/index.js (helpPanelComponents).
+function buildHelpPanelEmbed() {
+  return new EmbedBuilder()
     .setColor(BRAND_COLOR)
-    .setAuthor(brandAuthor(`❓ ${BRAND_NAME} · Help`))
+    .setAuthor(brandAuthor(`❓ ${BRAND_NAME} · Help Center`))
     .setTitle('How can we help?')
     .setDescription(
-      'Use the **ticket panel** to open a private channel with our team — pick the category ' +
-      'that fits your request (support, reports, applications, and more).',
+      `Welcome to the **${BRAND_NAME}** help center! Pick a guide below — it opens just for you ` +
+      '(only you can see it).\n\n' +
+      '📖 **Member Guide** — how to open tickets, apply for whitelist, and appeal a ban.\n' +
+      '🛠️ **Staff Guide** — moderation logging, ticket management, and whitelist tools.\n' +
+      '🎫 **Ticket Rules** — the rules for every ticket type and how tickets work.',
     )
-    .addFields({
-      name: '🎫 Opening a ticket',
-      value: 'Click a button on the ticket panel. You can have **one open ticket at a time**. ' +
-        'For whitelist applications, post your details and press **Submit for Review**.',
-      inline: false,
-    });
+    .setFooter(brandFooter(`${BRAND_NAME} • Choose a guide below`))
+    .setTimestamp();
+}
 
-  if (isStaff) {
-    embed.addFields(
+// Tutorial for regular members.
+function buildMemberGuideEmbed() {
+  return new EmbedBuilder()
+    .setColor(BRAND_COLOR)
+    .setAuthor(brandAuthor(`📖 ${BRAND_NAME} · Member Guide`))
+    .setTitle('Using the bot as a member')
+    .setDescription('Everything you need to get help, apply, or appeal — step by step.')
+    .addFields(
       {
-        name: '🛠️ Ticket commands (staff)',
-        value: [
-          '`/ticket-panel` — post the ticket panel (admin)',
-          '`/claim` · `/unclaim` — claim or release a ticket',
-          '`/add` · `/remove` — manage who can see a ticket',
-          '`/rename` — rename a ticket channel',
-          '`/close` — archive + close a ticket',
-        ].join('\n'),
+        name: '🎫 Opening a ticket',
+        value:
+          '1. Find the **ticket panel** and click the button for what you need.\n' +
+          '2. A **private channel** opens for you and the staff team.\n' +
+          '3. Describe your request clearly — add screenshots/your IGN if relevant.\n' +
+          '> You can only have **one open ticket at a time**, server-wide.',
         inline: false,
       },
       {
-        name: '📝 Whitelist (staff)',
-        value: '`/wl-accept <user>` — approve an applicant and grant the member role',
+        name: '📝 Applying for the whitelist',
+        value:
+          '1. Open a **Whitelist Application** ticket.\n' +
+          '2. Post your **IGN**, **age**, whether you own an **original copy** of Minecraft, and **why** you want to join.\n' +
+          '3. Click **📨 Submit for Review** — you may be approved automatically, or sent to staff.\n' +
+          '4. If not approved, use **Appeal Decision** to have a human review it.',
         inline: false,
       },
       {
-        name: '🔨 Moderation logging (staff)',
-        value: [
-          '`/log-ban` · `/lookup-ban` · `/update-appeal`',
-          '`/log-war` · `/lookup-war`',
-        ].join('\n'),
+        name: '⚖️ Appealing a ban',
+        value:
+          '1. Run **`/findban <your username>`** to get your **Ban ID**.\n' +
+          '2. Open a **⚖️ Ban Appeal** ticket and enter that Ban ID.\n' +
+          '3. Click **🔍 Look Up Ban** so staff can see your record, then explain your appeal.',
         inline: false,
       },
-      { name: '🩺 Utility', value: '`/help` · `/ping`', inline: false },
-    );
-  }
+      {
+        name: '💬 Good to know',
+        value:
+          '• Be patient and respectful — staff get a ping when your ticket opens.\n' +
+          '• Quiet tickets may be auto-closed; send a message to keep yours open.\n' +
+          '• Run **`/ping`** any time to check the bot is online.',
+        inline: false,
+      },
+    )
+    .setFooter(brandFooter(BRAND_NAME))
+    .setTimestamp();
+}
 
-  embed.setFooter(brandFooter(BRAND_NAME)).setTimestamp();
-  return embed;
+// Tutorial for staff.
+function buildStaffGuideEmbed() {
+  return new EmbedBuilder()
+    .setColor(BRAND_COLOR)
+    .setAuthor(brandAuthor(`🛠️ ${BRAND_NAME} · Staff Guide`))
+    .setTitle('Using the bot as staff')
+    .setDescription('Your toolkit for moderation logging and ticket handling.')
+    .addFields(
+      {
+        name: '🔨 Logging bans',
+        value:
+          '`/log-ban` — fill in the fields, then **upload screenshot evidence** in the channel and type `done` ' +
+          '(or wait 2 min). The ID is assigned automatically; HIGH/CRITICAL/PERMANENT pings senior staff. ' +
+          'Evidence is re-hosted permanently.',
+        inline: false,
+      },
+      {
+        name: '📂 Appeals & unbans',
+        value:
+          '`/update-appeal <id> <status>` — set Appealable / Unappealable / N/A.\n' +
+          '`/unban <id> [reason]` — mark a ban **lifted** and announce it in the ban log.',
+        inline: false,
+      },
+      {
+        name: '🔍 Lookups & analytics',
+        value:
+          '`/lookup-ban` — by ID or player (shows when it ends).\n' +
+          '`/banlist` — active or all bans, paged.\n' +
+          '`/history <player>` — a player\'s full ban timeline.\n' +
+          '`/stats` — server dashboard.  ·  `/lookup-war` — war/raid records.',
+        inline: false,
+      },
+      {
+        name: '🎫 Managing tickets',
+        value:
+          '`/claim` / `/unclaim` — lock a ticket to you + senior staff.\n' +
+          '`/add` / `/remove` — control who can see it.\n' +
+          '`/rename` — rename the channel.  ·  `/close [reason]` — archive (transcript) + delete.',
+        inline: false,
+      },
+      {
+        name: '📝 Whitelist & war logging',
+        value:
+          '`/wl-accept <user>` — approve an applicant and grant the member role.\n' +
+          '`/log-war` — log a war/raid approval.',
+        inline: false,
+      },
+      {
+        name: '⚙️ Permissions',
+        value:
+          'The bot needs **Manage Channels** (create tickets) and **Manage Roles** (claim/add and grant ' +
+          'the member role). Its role must sit **above** the ticket/member roles.',
+        inline: false,
+      },
+    )
+    .setFooter(brandFooter(BRAND_NAME))
+    .setTimestamp();
+}
+
+// Explains the ticket types + how tickets behave.
+function buildTicketRulesEmbed() {
+  return new EmbedBuilder()
+    .setColor(BRAND_COLOR)
+    .setAuthor(brandAuthor(`🎫 ${BRAND_NAME} · Ticket Rules`))
+    .setTitle('How tickets work & the rules')
+    .addFields(
+      {
+        name: '📋 The basics',
+        value:
+          '• **One open ticket at a time** per person, across all categories.\n' +
+          '• Pick the **correct category** for your request — wrong-category tickets may be closed.\n' +
+          '• Be respectful and provide details; staff handle tickets as soon as they can.\n' +
+          '• Don\'t open joke/empty tickets or re-open to "bump" — it slows everyone down.',
+        inline: false,
+      },
+      {
+        name: '🗂️ The ticket types',
+        value:
+          '📝 **Whitelist Application** — apply to join.\n' +
+          '🎫 **General Support** — questions / issues.\n' +
+          '⚔️ **War / Raid Request** — get a war or raid approved.\n' +
+          '🚩 **Member Report** — report a rule-breaking player.\n' +
+          '⚖️ **Ban Appeal** — appeal a ban (have your Ban ID ready).\n' +
+          '🛡️ **Staff Report** — report a staff member (senior staff only).\n' +
+          '🪖 **Staff Application** — apply to join staff (after a minimum time in the server).',
+        inline: false,
+      },
+      {
+        name: '🙋 Claiming & privacy',
+        value:
+          'Tickets are **private** — only you and staff can see yours. When a staffer **claims** a ticket, ' +
+          'only they and senior staff reply from then on, so you get one consistent handler.',
+        inline: false,
+      },
+      {
+        name: '🔒 Closing & inactivity',
+        value:
+          'Closing a ticket saves a **transcript** for staff records, then deletes the channel. ' +
+          'Inactive tickets may be **auto-closed** after a warning — just reply to keep yours open.',
+        inline: false,
+      },
+    )
+    .setFooter(brandFooter(BRAND_NAME))
+    .setTimestamp();
+}
+
+// ── /stats ────────────────────────────────────────────────────────────────────
+// `bans` = summarizeBans(...), `wars` = summarizeWars(...) from src/stats.js.
+function buildStatsEmbed({ bans, wars, openTickets }) {
+  const sevLine = ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL', 'PERMANENT']
+    .filter(k => bans.severity[k]).map(k => `${SEVERITY_EMOJI[k]} ${bans.severity[k]}`).join('   ') || '—';
+  const staffLine = bans.topStaff.length
+    ? bans.topStaff.map(([name, n], i) => `\`${i + 1}.\` ${name} — **${n}**`).join('\n')
+    : '—';
+  const warStatusLine = ['APPROVED', 'DENIED', 'PENDING']
+    .filter(k => wars.status[k]).map(k => `${STATUS_EMOJI[k]} ${wars.status[k]}`).join('   ') || '—';
+  const typeLine = ['war', 'raid']
+    .filter(k => wars.type[k]).map(k => `${TYPE_EMOJI[k]} ${wars.type[k]}`).join('   ');
+
+  return new EmbedBuilder()
+    .setColor(BRAND_COLOR)
+    .setAuthor(brandAuthor(`📊 ${BRAND_NAME} · Server Stats`))
+    .setTitle('Moderation Dashboard')
+    .addFields(
+      { name: '🔨 Bans', value: `**${bans.total}** total\n🔴 ${bans.active} active · ✅ ${bans.expired} expired · 🔓 ${bans.lifted} lifted`, inline: true },
+      { name: '⚔️ War / Raid', value: `**${wars.total}** total\n${warStatusLine}${typeLine ? `\n${typeLine}` : ''}`, inline: true },
+      { name: '🎫 Open Tickets', value: `**${openTickets}**`, inline: true },
+      { name: '⚠️ Bans by severity', value: sevLine, inline: false },
+      { name: '🛡️ Top staff', value: staffLine, inline: false },
+    )
+    .setFooter(brandFooter(BRAND_NAME))
+    .setTimestamp();
 }
 
 // ── /ping ───────────────────────────────────────────────────────────────────────
@@ -470,6 +771,21 @@ module.exports = {
   buildTicketNoticeEmbed,
   buildTicketClosingEmbed,
   buildTicketCloseLogEmbed,
-  buildHelpEmbed,
+  buildHelpPanelEmbed,
+  buildMemberGuideEmbed,
+  buildStaffGuideEmbed,
+  buildTicketRulesEmbed,
   buildStatusEmbed,
+  buildBanListEmbed,
+  buildUnbanEmbed,
+  buildTicketInactivityEmbed,
+  buildStatsEmbed,
+  buildHistoryEmbed,
+  buildMyBansEmbed,
+  banListLine,
+  historyLine,
+  myBanLine,
+  // ── Exported for tests ──
+  parseEvidence,
+  banEndShort,
 };

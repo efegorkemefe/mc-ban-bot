@@ -26,6 +26,7 @@ const {
   buildTicketOpenEmbed,
   buildTicketClosingEmbed,
   buildTicketCloseLogEmbed,
+  buildTicketInactivityEmbed,
 } = require('./embeds');
 
 // ── Config (from .env) ────────────────────────────────────────────────────────
@@ -109,6 +110,23 @@ const TICKET_TYPES = {
     pingSenior: false,
     minDays: 0,
   },
+  ban_appeal: {
+    key: 'ban_appeal',
+    label: 'Ban Appeal',
+    short: 'ban-appeal',
+    emoji: '⚖️',
+    color: 0x5865f2,
+    style: ButtonStyle.Secondary,
+    description: 'Appeal a ban you believe was unfair.',
+    prompt:
+      '• The **Ban ID** you are appealing (e.g. `004`)\n' +
+      '• Why do you believe it should be lifted?\n' +
+      '• Any evidence that supports your appeal\n\n' +
+      'When ready, click **🔍 Look Up Ban** below to attach your ban record for staff.',
+    pingSenior: false,
+    pingStaff: true,
+    minDays: 0,
+  },
   staff_report: {
     key: 'staff_report',
     label: 'Staff Report',
@@ -144,7 +162,7 @@ const TICKET_TYPES = {
 };
 
 // Order the panel buttons / categories are presented in.
-const TYPE_ORDER = ['whitelist', 'support', 'war_raid', 'member_report', 'staff_report', 'staff_app'];
+const TYPE_ORDER = ['whitelist', 'support', 'war_raid', 'member_report', 'ban_appeal', 'staff_report', 'staff_app'];
 
 // ── Persistence (data/tickets.json) ────────────────────────────────────────────
 const DATA_DIR = path.join(__dirname, '..', 'data');
@@ -165,9 +183,10 @@ function saveStore(store) {
 
 function guildCfg(store, guildId) {
   if (!store.guilds[guildId]) {
-    store.guilds[guildId] = { categories: {}, counters: {}, panelChannelId: null, claims: {} };
+    store.guilds[guildId] = { categories: {}, counters: {}, panelChannelId: null, claims: {}, inactivity: {} };
   }
   if (!store.guilds[guildId].claims) store.guilds[guildId].claims = {};
+  if (!store.guilds[guildId].inactivity) store.guilds[guildId].inactivity = {};
   return store.guilds[guildId];
 }
 
@@ -365,6 +384,16 @@ function ticketControlComponents(claimed, typeKey) {
     );
   }
 
+  if (typeKey === 'ban_appeal') {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId('ticket:lookupban')
+        .setLabel('Look Up Ban')
+        .setEmoji('🔍')
+        .setStyle(ButtonStyle.Primary),
+    );
+  }
+
   row.addComponents(
     new ButtonBuilder()
       .setCustomId('ticket:claim')
@@ -464,11 +493,6 @@ async function giveMemberRole(guild, userId) {
   }
 }
 
-// Roles to ping when something is escalated to staff (prefer senior staff).
-function escalationRoleIds() {
-  return SENIOR_ROLE_IDS.length ? SENIOR_ROLE_IDS : STAFF_ROLE_IDS;
-}
-
 // ── Create a ticket ────────────────────────────────────────────────────────────
 // Returns { ok: true, channel } or { ok: false, message } (a user-facing reason).
 // `options.answers` is an optional array of { name, value, inline } rendered as a
@@ -527,19 +551,20 @@ async function createTicket(guild, member, typeKey, options = {}) {
     permissionOverwrites: ticketOverwrites(guild, member.id),
   });
 
-  // Ping the owner, plus senior staff for staff reports.
+  // Ping the owner, plus senior staff for staff reports / regular staff for
+  // ban appeals (so a human is alerted to escalations that need review).
   const mentions = [`<@${member.id}>`];
   const roleMentions = [];
-  if (t.pingSenior && SENIOR_ROLE_IDS.length) {
-    for (const r of SENIOR_ROLE_IDS) mentions.push(`<@&${r}>`);
-    roleMentions.push(...SENIOR_ROLE_IDS);
-  }
+  if (t.pingSenior && SENIOR_ROLE_IDS.length) roleMentions.push(...SENIOR_ROLE_IDS);
+  if (t.pingStaff) roleMentions.push(...staffPingRoleIds());
+  const uniqueRoles = [...new Set(roleMentions)];
+  for (const r of uniqueRoles) mentions.push(`<@&${r}>`);
 
   await channel.send({
     content: mentions.join(' '),
     embeds: [buildTicketOpenEmbed(t, `<@${member.id}>`, t.prompt)],
     components: ticketControlComponents(false, typeKey),
-    allowedMentions: { users: [member.id], roles: roleMentions },
+    allowedMentions: { users: [member.id], roles: uniqueRoles },
   });
 
   return { ok: true, channel };
@@ -712,11 +737,73 @@ function countOpenTickets(guild) {
   return n;
 }
 
+// ── Inactivity auto-close ───────────────────────────────────────────────────────
+// "warned" state is kept in the local store so a ticket is warned only once.
+function getInactivity(guildId, channelId) {
+  return guildCfg(loadStore(), guildId).inactivity[channelId] || null;
+}
+
+function setInactivityWarned(guildId, channelId, warnedAt) {
+  const store = loadStore();
+  guildCfg(store, guildId).inactivity[channelId] = { warnedAt };
+  saveStore(store);
+}
+
+function clearInactivity(guildId, channelId) {
+  const store = loadStore();
+  const cfg = guildCfg(store, guildId);
+  if (cfg.inactivity[channelId]) {
+    delete cfg.inactivity[channelId];
+    saveStore(store);
+  }
+}
+
+// Newest non-bot message timestamp (so the bot's own warning doesn't reset the
+// idle clock). Falls back to channel creation time when no human has spoken.
+async function lastHumanActivity(channel) {
+  const batch = await channel.messages.fetch({ limit: 20 }).catch(() => null);
+  if (batch) {
+    for (const m of batch.values()) { // iterated newest-first
+      if (!m.author.bot) return m.createdTimestamp;
+    }
+  }
+  return channel.createdTimestamp;
+}
+
+// Scans open tickets and warns, then auto-closes, the ones idle past the
+// configured thresholds. No-op when closeHours is unset/<=0.
+async function sweepInactiveTickets(guild, client, { warnHours, closeHours }) {
+  if (!closeHours || closeHours <= 0) return;
+  const now = Date.now();
+
+  for (const ch of guild.channels.cache.values()) {
+    const meta = decodeTopic(ch.topic);
+    if (!meta || meta.status === 'closed') continue;
+    if (ch.type !== ChannelType.GuildText) continue;
+
+    const idleH = (now - (await lastHumanActivity(ch))) / 3_600_000;
+
+    if (idleH >= closeHours) {
+      clearInactivity(guild.id, ch.id);
+      await closeTicket(ch, { id: client.user.id }, `Auto-closed after ~${Math.round(idleH)}h of inactivity`, client).catch(() => {});
+    } else if (warnHours && idleH >= warnHours) {
+      if (!getInactivity(guild.id, ch.id)?.warnedAt) {
+        setInactivityWarned(guild.id, ch.id, now);
+        await ch.send({ embeds: [buildTicketInactivityEmbed({ idleHours: Math.round(idleH), closeHours })] }).catch(() => {});
+      }
+    } else if (getInactivity(guild.id, ch.id)?.warnedAt) {
+      clearInactivity(guild.id, ch.id); // activity resumed → reset the warning
+    }
+  }
+}
+
 module.exports = {
   TICKET_TYPES,
   isStaff,
   isSenior,
+  encodeTopic,
   decodeTopic,
+  humanizeDuration,
   ensureCategories,
   postPanel,
   createTicket,
@@ -732,8 +819,8 @@ module.exports = {
   findAnyOpenTicketByUser,
   collectApplicationText,
   giveMemberRole,
-  escalationRoleIds,
   staffPingRoleIds,
   countOpenTickets,
   getClaimedBy,
+  sweepInactiveTickets,
 };
