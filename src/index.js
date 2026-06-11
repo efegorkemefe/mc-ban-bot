@@ -22,10 +22,8 @@ const {
   buildTicketUnclaimEmbed,
   buildTicketNoticeEmbed,
   buildWhitelistReviewEmbed,
-  buildHelpPanelEmbed,
-  buildMemberGuideEmbed,
-  buildStaffGuideEmbed,
-  buildTicketRulesEmbed,
+  buildMemberPanel,
+  buildStaffPanel,
   buildStatusEmbed,
   buildBanListEmbed,
   buildUnbanEmbed,
@@ -188,7 +186,6 @@ client.on(Events.InteractionCreate, async interaction => {
     if (interaction.isButton()) {
       if (interaction.customId.startsWith('ticket:')) return await handleTicketButton(interaction);
       if (interaction.customId.startsWith('pg:')) return await handlePaginatorButton(interaction);
-      if (interaction.customId.startsWith('help:')) return await handleHelpButton(interaction);
       return;
     }
 
@@ -215,7 +212,8 @@ client.on(Events.InteractionCreate, async interaction => {
       case 'close':         return await handleTicketClose(interaction);
       case 'wl-accept':     return await handleWlAccept(interaction);
       case 'help':          return await handleHelp(interaction);
-      case 'help-panel':    return await handleHelpPanel(interaction);
+      case 'info-panel':    return await handleInfoPanel(interaction);
+      case 'staff-panel':   return await handleStaffPanel(interaction);
       case 'ping':          return await handlePing(interaction);
     }
   } catch (err) {
@@ -1096,39 +1094,34 @@ async function handleLookupWar(interaction) {
   await replyPaginated(interaction, embeds, `Found **${matches.length}** record(s) for \`${team}\`:`);
 }
 
-// ── Help Center (/help, /help-panel) ────────────────────────────────────────────
-// The three guide buttons shown on the help panel.
-function helpPanelComponents() {
-  return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('help:member').setLabel('Member Guide').setEmoji('📖').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('help:staff').setLabel('Staff Guide').setEmoji('🛠️').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('help:rules').setLabel('Ticket Rules').setEmoji('🎫').setStyle(ButtonStyle.Secondary),
-  )];
+// ── Help panels (/help, /info-panel, /staff-panel) ──────────────────────────────
+function guildIconUrl(interaction) {
+  return interaction.guild?.iconURL ? interaction.guild.iconURL({ size: 256 }) : null;
 }
 
-// /help — show the help center to the person who ran it (ephemeral).
+// /help — show the player help board privately to whoever runs it.
 async function handleHelp(interaction) {
-  return interaction.reply({ embeds: [buildHelpPanelEmbed()], components: helpPanelComponents(), ephemeral: true });
+  return interaction.reply({ embeds: buildMemberPanel(guildIconUrl(interaction)), ephemeral: true });
 }
 
-// /help-panel — admins post the help center publicly in the current channel.
-async function handleHelpPanel(interaction) {
+// /info-panel — admins post the player board publicly (e.g. in #info).
+async function handleInfoPanel(interaction) {
   if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
-    return interaction.reply({ content: '❌ You need the **Manage Server** permission to post the help panel.', ephemeral: true });
+    return interaction.reply({ content: '❌ You need the **Manage Server** permission to post the info panel.', ephemeral: true });
   }
   await interaction.deferReply({ ephemeral: true });
-  await interaction.channel.send({ embeds: [buildHelpPanelEmbed()], components: helpPanelComponents() });
-  return interaction.editReply('✅ Help panel posted.');
+  await interaction.channel.send({ embeds: buildMemberPanel(guildIconUrl(interaction)) });
+  return interaction.editReply('✅ Player info panel posted.');
 }
 
-// Guide buttons → reply privately with the chosen tutorial (works on both the
-// public panel and the ephemeral /help message).
-async function handleHelpButton(interaction) {
-  const which = interaction.customId.split(':')[1];
-  const embed = which === 'staff' ? buildStaffGuideEmbed()
-    : which === 'rules' ? buildTicketRulesEmbed()
-      : buildMemberGuideEmbed();
-  return interaction.reply({ embeds: [embed], ephemeral: true });
+// /staff-panel — admins post the staff handbook (e.g. in the staff channel).
+async function handleStaffPanel(interaction) {
+  if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+    return interaction.reply({ content: '❌ You need the **Manage Server** permission to post the staff panel.', ephemeral: true });
+  }
+  await interaction.deferReply({ ephemeral: true });
+  await interaction.channel.send({ embeds: buildStaffPanel(guildIconUrl(interaction)) });
+  return interaction.editReply('✅ Staff handbook posted.');
 }
 
 // ── /ping ─────────────────────────────────────────────────────────────────────

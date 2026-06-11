@@ -178,16 +178,24 @@ const commands = [
     .addUserOption(o => o.setName('user').setDescription('The user to whitelist').setRequired(true))
     .toJSON(),
 
-  // /help — command reference.
+  // /help — show the player help board privately.
   new SlashCommandBuilder()
     .setName('help')
-    .setDescription('Open the help center (member & staff guides, ticket rules)')
+    .setDescription('Show the player help & info guide (private to you)')
     .toJSON(),
 
-  // /help-panel — admins post the public help center.
+  // /info-panel — admins post the player help board (e.g. in #info).
   new SlashCommandBuilder()
-    .setName('help-panel')
-    .setDescription('Post the public help panel (member + staff guides, ticket rules)')
+    .setName('info-panel')
+    .setDescription('Post the player Help & Info board in this channel (admin)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .setDMPermission(false)
+    .toJSON(),
+
+  // /staff-panel — admins post the staff handbook (e.g. in the staff channel).
+  new SlashCommandBuilder()
+    .setName('staff-panel')
+    .setDescription('Post the staff handbook board in this channel (admin)')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .setDMPermission(false)
     .toJSON(),
