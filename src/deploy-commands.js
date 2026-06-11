@@ -54,6 +54,14 @@ const commands = [
     .addStringOption(o => o.setName('query').setDescription('Ban ID (e.g. 004) or player username').setRequired(true))
     .toJSON(),
 
+  // ── /findban ────────────────────────────────────────────────────────────────────
+  // Public, so a banned player can find their own Ban ID to give to staff.
+  new SlashCommandBuilder()
+    .setName('findban')
+    .setDescription('Find your Ban ID by Minecraft username (to give to staff for an appeal)')
+    .addStringOption(o => o.setName('username').setDescription('Your exact Minecraft username').setRequired(true))
+    .toJSON(),
+
   // ── /banlist ────────────────────────────────────────────────────────────────────
   new SlashCommandBuilder()
     .setName('banlist')

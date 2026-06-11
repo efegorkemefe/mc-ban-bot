@@ -138,6 +138,15 @@ function historyLine(ban, { lifted = false } = {}) {
     (ends ? ` · ${ends}` : '') + (lifted ? ' · 🔓 lifted' : '');
 }
 
+// Player-facing line for /findban — leads with the Ban ID they hand to staff,
+// and omits internal details (staff member, evidence).
+function myBanLine(ban, { lifted = false } = {}) {
+  const id = normalizeBanId(ban.ban_id);
+  const sev = SEVERITY_EMOJI[up(ban.severity)] ?? '⚪';
+  const status = lifted ? '🔓 lifted' : (banEndShort(ban) || '🔴 active');
+  return `**Ban ID: \`${id || '—'}\`** — ${sev} ${up(ban.severity) || '—'} · \`${ban.date || '—'}\` · ${status} · 📂 ${appealLabel(ban.appeal_status)}`;
+}
+
 // ── Ban embed ─────────────────────────────────────────────────────────────────
 // `evidence` is the options object passed to applyEvidence ({ urls, imageUrl, count }).
 function buildBanEmbed(data, evidence = {}, staffMention) {
@@ -276,6 +285,21 @@ function buildHistoryEmbed({ player, lines, page = 0, totalPages = 1, total = 0,
       (lines.length ? lines.join('\n') : '_No bans on record._'),
     )
     .setFooter(brandFooter(`${BRAND_NAME} • Page ${page + 1}/${totalPages}`))
+    .setTimestamp();
+}
+
+// ── /findban (player self-service: "what's my ban ID?") ─────────────────────────
+function buildMyBansEmbed({ username, lines, anyActive }) {
+  return new EmbedBuilder()
+    .setColor(anyActive ? 0xe84343 : NEUTRAL)
+    .setAuthor(brandAuthor(`🔎 ${BRAND_NAME} · Ban Lookup`))
+    .setTitle(`Ban record for ${username}`)
+    .setDescription(
+      `Found **${lines.length}** ban(s) for **${username}**.\n\n` +
+      lines.join('\n') +
+      '\n\n**To appeal:** open a **⚖️ Ban Appeal** ticket from the ticket panel and give staff the **Ban ID** shown above.',
+    )
+    .setFooter(brandFooter(BRAND_NAME))
     .setTimestamp();
 }
 
@@ -526,12 +550,20 @@ function buildHelpEmbed({ isStaff }) {
       'Use the **ticket panel** to open a private channel with our team — pick the category ' +
       'that fits your request (support, reports, applications, and more).',
     )
-    .addFields({
-      name: '🎫 Opening a ticket',
-      value: 'Click a button on the ticket panel. You can have **one open ticket at a time**. ' +
-        'For whitelist applications, post your details and press **Submit for Review**.',
-      inline: false,
-    });
+    .addFields(
+      {
+        name: '🎫 Opening a ticket',
+        value: 'Click a button on the ticket panel. You can have **one open ticket at a time**. ' +
+          'For whitelist applications, post your details and press **Submit for Review**.',
+        inline: false,
+      },
+      {
+        name: '🔎 Banned? Find your Ban ID',
+        value: 'Run **`/findban <username>`** to look up your Ban ID, then open a **⚖️ Ban Appeal** ' +
+          'ticket and give that ID to staff.',
+        inline: false,
+      },
+    );
 
   if (isStaff) {
     embed.addFields(
@@ -634,8 +666,10 @@ module.exports = {
   buildTicketInactivityEmbed,
   buildStatsEmbed,
   buildHistoryEmbed,
+  buildMyBansEmbed,
   banListLine,
   historyLine,
+  myBanLine,
   // ── Exported for tests ──
   parseEvidence,
   banEndShort,

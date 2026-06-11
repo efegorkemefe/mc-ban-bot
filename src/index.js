@@ -28,8 +28,10 @@ const {
   buildUnbanEmbed,
   buildStatsEmbed,
   buildHistoryEmbed,
+  buildMyBansEmbed,
   banListLine,
   historyLine,
+  myBanLine,
 } = require('./embeds');
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -192,6 +194,7 @@ client.on(Events.InteractionCreate, async interaction => {
       case 'log-ban':       return await handleLogBan(interaction);
       case 'update-appeal': return await handleUpdateAppeal(interaction);
       case 'lookup-ban':    return await handleLookupBan(interaction);
+      case 'findban':       return await handleFindBan(interaction);
       case 'banlist':       return await handleBanList(interaction);
       case 'unban':         return await handleUnban(interaction);
       case 'stats':         return await handleStats(interaction);
@@ -905,6 +908,30 @@ async function handleLookupBan(interaction) {
     return buildBanLookupEmbed(ban, { unban: banState.getUnban(ban.ban_id) });
   });
   await replyPaginated(interaction, embeds, `Found **${matches.length}** ban(s) for \`${query}\`:`);
+}
+
+// ── /findban (public: a player looks up their own Ban ID to give to staff) ───────
+async function handleFindBan(interaction) {
+  const username = interaction.options.getString('username');
+  await interaction.deferReply({ ephemeral: true });
+
+  const matches = await withTimeout(sheets.findBansByPlayer(username));
+  if (matches.length === 0) {
+    return interaction.editReply(
+      `✅ No bans found for \`${username}\`. If you think this is wrong, make sure you typed your **exact** in-game name.`,
+    );
+  }
+
+  // Newest first; cap at 15 lines so the embed description stays within limits.
+  const bans = matches.slice().reverse().map(m => sheets.rowToBan(m.rowData)).slice(0, 15);
+  let anyActive = false;
+  const lines = bans.map(b => {
+    const lifted = banState.isUnbanned(b.ban_id);
+    if (!lifted && computeBanEnd(b.date, b.duration).state !== 'ended') anyActive = true;
+    return myBanLine(b, { lifted });
+  });
+
+  return interaction.editReply({ embeds: [buildMyBansEmbed({ username, lines, anyActive })] });
 }
 
 // ── /banlist ────────────────────────────────────────────────────────────────────

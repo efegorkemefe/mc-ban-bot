@@ -66,6 +66,7 @@ Two Google Sheet tabs are used inside one spreadsheet:
 
 | Command | Who | What it does |
 |---------|-----|--------------|
+| `/findban` | Everyone | A banned player looks up **their own Ban ID** by username (to give staff when appealing). |
 | `/help` | Everyone | Shows how to use the bot; lists staff commands for staff. |
 | `/ping` | Everyone | Bot status — latency, uptime, and open-ticket count. |
 
