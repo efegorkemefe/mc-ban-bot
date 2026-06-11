@@ -1,13 +1,19 @@
-# 🔨 SovietCraft Staff Bot (`mc-ban-bot`)
+# 🔨 SovietCraft Community Bot (`mc-ban-bot`)
 
-A Discord bot for the **SovietCraft** Minecraft server. Staff use slash commands to
-log player **bans** and **war/raid approvals**. Every entry is:
+An all-in-one Discord bot for a Minecraft community. Three systems in one:
 
-1. Written into a **Google Sheet** (styled to match the sheet's dark theme), and
-2. Posted as a clean **embed** in the right Discord staff channel.
+1. **Moderation logging** — staff log player **bans** and **war/raid approvals**;
+   each entry is written to a styled **Google Sheet** and posted as a clean embed.
+2. **Ticket system** — a button **control panel** opens private, category-based
+   support/report/application channels with staff **claiming**, `/add`/`/remove`,
+   and saved **transcripts** on close.
+3. **Whitelist applications** — applicants apply in a ticket; **AI** (Claude) can
+   auto-approve and grant the member role, or — with no API key — applications go
+   to staff for manual approval via `/wl-accept`.
 
-This README is meant to get a new developer up to speed quickly. No deep Discord or
-Google knowledge assumed.
+Everything is **rebrandable** via `.env` (name, colour, icon), so it isn't tied to
+one server. This README gets a new developer up to speed quickly — no deep Discord
+or Google knowledge assumed.
 
 ---
 
@@ -38,6 +44,26 @@ Two Google Sheet tabs are used inside one spreadsheet:
 | `/lookup-ban` | Find a ban by its ID, or all recent bans for a player username. |
 | `/log-war` | Log a war or raid approval. Posts immediately — no evidence step. |
 | `/lookup-war` | Find war/raid records for a team or player. |
+
+### Ticket commands
+
+| Command | Who | What it does |
+|---------|-----|--------------|
+| `/ticket-panel` | Admin (Manage Server) | Posts the ticket control panel in the current channel and auto-creates the six ticket categories. |
+| `/add` | Staff | Add a user to the current ticket. |
+| `/remove` | Staff | Remove a user from the current ticket (cannot remove the owner). |
+| `/claim` | Staff | Claim the ticket — only you and senior staff can respond afterward. |
+| `/unclaim` | Claimer / Senior | Release a claimed ticket so all staff can respond again. |
+| `/rename` | Staff | Rename the ticket channel. |
+| `/close` | Staff / Owner | Archive (save transcript) and delete the ticket. |
+| `/wl-accept` | Staff | Manually approve a whitelist applicant and grant them the member role. |
+
+### Utility commands
+
+| Command | Who | What it does |
+|---------|-----|--------------|
+| `/help` | Everyone | Shows how to use the bot; lists staff commands for staff. |
+| `/ping` | Everyone | Bot status — latency, uptime, and open-ticket count. |
 
 ### The `/log-ban` evidence flow
 
@@ -90,10 +116,13 @@ update those constants to match.
 ```
 mc-ban-bot/
 ├── src/
-│   ├── index.js            # Bot entry point: logs in, routes slash commands, evidence flow
+│   ├── index.js            # Bot entry point: routes slash commands + ticket buttons, evidence flow
 │   ├── deploy-commands.js  # Registers the slash commands with Discord (run once)
 │   ├── sheets.js           # All Google Sheets reads/writes + cell styling + auto-ID
-│   └── embeds.js           # Builds the Discord embeds (ban, war, appeal, lookups)
+│   ├── tickets.js          # Ticket system: panel, categories, claim/close, transcripts, whitelist
+│   ├── ai.js               # Claude-powered whitelist application review
+│   └── embeds.js           # Builds the Discord embeds (ban, war, appeal, lookups, tickets)
+├── data/                   # Runtime state (ticket counters + category IDs) — gitignored, auto-created
 ├── credentials.json        # Google service-account key — NEVER commit (gitignored)
 ├── .env                    # Secrets — NEVER commit (gitignored)
 ├── .env.example            # Template showing which env vars are needed
@@ -113,8 +142,12 @@ mc-ban-bot/
    (needed to read uploaded evidence).
 4. **OAuth2 → URL Generator**: scopes `bot` + `applications.commands`; permissions
    `Send Messages`, `Embed Links`, `Read Message History`, `Manage Messages`
-   (Manage Messages lets the bot auto-delete evidence uploads), and `Mention Everyone`
-   if you want senior-role pings to work.
+   (Manage Messages lets the bot auto-delete evidence uploads), `Manage Channels`
+   (required by the ticket system to create categories/channels), `Manage Roles`
+   (to edit ticket permission overwrites for claiming and to grant the member role
+   on whitelist approval), and `Mention Everyone` if you want senior-role pings to
+   work. The bot's role must sit **above** the member role in the role list, or it
+   can't assign it.
 5. Invite the bot with the generated URL.
 6. Copy the **Application ID** (→ `CLIENT_ID`).
 
@@ -134,12 +167,26 @@ Copy `.env.example` → `.env` and fill it in:
 ```env
 DISCORD_TOKEN=          # Bot token
 CLIENT_ID=              # Application ID
+
+# ── Branding (optional — rebrand without touching code) ──
+BRAND_NAME=SovietCraft  # Name shown across all embeds
+BRAND_COLOR=#5865f2     # Accent colour for panel / info embeds (hex)
+BRAND_ICON_URL=         # Optional icon for embed author/footer lines
 BAN_LOG_CHANNEL_ID=     # Channel where ban embeds are posted
 WAR_LOG_CHANNEL_ID=     # Channel where war/raid embeds are posted
-SENIOR_ROLE_IDS=        # Comma-separated role IDs to ping for HIGH/CRITICAL/PERMANENT bans
+SENIOR_ROLE_IDS=        # Comma-separated role IDs to ping for HIGH/CRITICAL/PERMANENT bans + Staff Reports
 SPREADSHEET_ID=         # From the sheet URL: docs.google.com/spreadsheets/d/<THIS>/edit
 BAN_SHEET_NAME=Ban Logs
 WAR_SHEET_NAME=War & Raid Approvals
+
+# ── Ticket system ──
+STAFF_ROLE_IDS=         # Roles that can run every ticket / whitelist command (blank = Manage Server)
+TICKET_LOG_CHANNEL_ID=  # Channel where closed-ticket transcripts + summaries are posted
+STAFF_APP_MIN_DAYS=7    # Membership age (days) required to open a Staff Application
+
+# ── Whitelist ──
+MEMBER_ROLE_ID=         # Role granted on whitelist approval (AI auto-approve or /wl-accept)
+ANTHROPIC_API_KEY=      # Claude API key for AI whitelist review (blank = manual review only)
 ```
 
 > To copy channel/role IDs in Discord: **User Settings → Advanced → Developer Mode**,
@@ -170,24 +217,124 @@ npm start        # starts the bot
 - **Auto-delete needs the Manage Messages permission** in the channel. Without it,
   logging still works — the upload message just isn't removed.
 
+### Ticket / whitelist troubleshooting
+
+- **`/add`, `/claim`, `/unclaim`, `/wl-accept` say "I'm missing Manage Roles" or
+  "couldn't assign the role":** the bot needs the **Manage Roles** permission, and its
+  role must sit **above** the ticket/member roles. Creating tickets only needs Manage
+  Channels, but editing permissions and granting the member role need Manage Roles.
+- **A command replies "Discord is rate-limiting this channel":** you hit Discord's
+  channel-edit limit (e.g. claim/unclaim/rename in quick succession). Wait a minute
+  and retry — the command no longer hangs, it just tells you to try again.
+- **`/wl-accept` doesn't show up:** run `npm run deploy` (commands only register when
+  you run that), then restart.
+- **Whitelist Submit just pings staff instead of auto-deciding:** that's expected when
+  `ANTHROPIC_API_KEY` is blank — see [AI whitelist review](#-ai-whitelist-review).
+- **The startup log prints ⚠️ warnings:** that report (channels, roles, permissions)
+  tells you exactly what's missing — fix those first.
+
 ---
 
-## 🛣️ Roadmap — Ticket system (planned, not built yet)
+## 🎫 Ticket system
 
-We plan to add a **support/report ticket system** next. The rough idea:
+A **control-panel, category-based** ticket system. Members click a button on a
+pinned panel; the bot opens a **private channel** for them inside that ticket
+type's own category. Staff manage it with slash commands and buttons.
 
-- A `/ticket` command (or a button on a pinned message) opens a private thread or
-  channel for a player report / ban appeal / staff application.
-- Tickets get logged to a **new `Tickets` tab** in the same spreadsheet (status:
-  `OPEN` / `IN PROGRESS` / `CLOSED`, assigned staff, category, timestamps).
-- Closing a ticket posts a summary embed and archives the thread.
-- Likely ties into the existing ban logs (e.g. an appeal ticket links to a `Ban ID`).
+### The six ticket types
 
-When implementing, follow the existing patterns:
-- Add the command definition in `src/deploy-commands.js`.
-- Put all sheet logic in `src/sheets.js` (reuse `formatRow`, `getSheetId`, the `THEME`).
-- Put embed builders in `src/embeds.js`.
-- Wire the handler into the router in `src/index.js`.
+| Type | Category | Notes |
+|------|----------|-------|
+| 📝 Whitelist Application | own category | — |
+| 🎫 General Support | own category | — |
+| ⚔️ War / Raid Request | own category | — |
+| 🚩 Member Report | own category | — |
+| 🛡️ Staff Report | own category | **Pings senior staff** when opened |
+| 🪖 Staff Application | own category | **Blocked** unless the member has been in the server ≥ `STAFF_APP_MIN_DAYS` (default 7) |
+
+### Setup (one command)
+
+Run **`/ticket-panel`** in the channel where you want the panel. On first run the
+bot **auto-creates the six categories** (hidden from `@everyone`, visible to staff)
+and posts the panel with one button per type. Re-running it just re-posts the panel;
+existing categories are reused.
+
+> The bot needs the **Manage Channels** permission to create categories/channels and
+> edit ticket permissions. Make sure it's high enough in the role list.
+
+### How a ticket flows
+
+1. A member clicks a panel button → the bot creates `type-0001` in that category,
+   visible only to the member + staff, and posts a professional opening embed
+   (with a per-type checklist of what to provide) plus **Claim** / **Close** buttons.
+   - **One ticket per user, server-wide:** if they already have any open ticket,
+     they're pointed to it instead of opening a new one.
+   - **Whitelist** is different — see [AI whitelist review](#-ai-whitelist-review) below.
+2. **Claiming** (button or `/claim`) locks the ticket: regular staff can still read
+   but can no longer send — only the **claimer** and **senior staff** can respond.
+   The channel is also renamed with a `CLM-` prefix (e.g. `CLM-support-0001`) so
+   claimed tickets are obvious at a glance. `/unclaim` reverses both.
+3. **`/add` / `/remove`** grant or revoke access for extra users.
+4. **Closing** (button or `/close [reason]`) saves a full **text transcript** plus a
+   summary embed to `TICKET_LOG_CHANNEL_ID`, then deletes the channel after 5s.
+
+### How state is stored
+
+Lightweight, no real database. Each ticket channel encodes its `type`/`owner`/`status`
+in the **channel topic** (written once at creation), and permission overwrites are the
+source of truth for who can see/speak. A small JSON file (`data/tickets.json`,
+gitignored) holds the per-type **category IDs**, the per-type **counter**, and the
+**claim state** (who claimed which ticket).
+
+> **Why claim state lives in the file, not the topic:** Discord rate-limits channel
+> name/topic edits to ~2 per 10 minutes. Storing claim state in the topic meant
+> claim/unclaim hit that limit and hung. The JSON store has no such limit, and the
+> `CLM-` rename is fire-and-forget so it can never block a command.
+
+### 🤖 AI whitelist review
+
+The **Whitelist Application** type is handled by Claude. The flow:
+
+1. The applicant opens a whitelist ticket and types their answers (Minecraft
+   username, age, whether they own an original copy of MC, why they want to join)
+   directly in the channel.
+2. They click **📨 Submit for Review**. The bot gathers their messages and sends
+   them to Claude (`claude-opus-4-8`), which returns an approve/reject verdict.
+3. **Approved →** the bot **automatically grants the member role** (`MEMBER_ROLE_ID`),
+   posts the verdict, and auto-closes the ticket after ~10s.
+4. **Rejected →** the bot posts the reasons and shows an **Appeal Decision** button.
+   Appealing pings senior staff (or staff) so a human can review — and approve with
+   `/wl-accept` if warranted.
+
+Staff can always approve manually with **`/wl-accept <user>`**, which grants the
+member role regardless of the AI's decision.
+
+> **No API key?** AI review is optional. If `ANTHROPIC_API_KEY` is blank, clicking
+> Submit simply pings staff for a manual review — nothing breaks. The Anthropic SDK
+> (`@anthropic-ai/sdk`) is already in `package.json`; run `npm install` to pull it.
+
+### Config
+
+Roles/limits come from `.env` (see `.env.example`):
+
+- `STAFF_ROLE_IDS` — roles that can run **every** ticket / whitelist command. If
+  blank, anyone with **Manage Server** is treated as staff.
+- `SENIOR_ROLE_IDS` — reused from the ban config; senior staff can speak in
+  *claimed* tickets and are pinged for Staff Reports and whitelist appeals.
+- `TICKET_LOG_CHANNEL_ID` — where transcripts + close summaries are posted.
+- `STAFF_APP_MIN_DAYS` — membership age required to open a Staff Application.
+- `MEMBER_ROLE_ID` — role granted on whitelist approval (AI or `/wl-accept`).
+- `ANTHROPIC_API_KEY` — enables AI whitelist review; blank = manual review only.
+
+### Where the code lives
+
+- Ticket type definitions, panel, claim/close logic, transcripts → `src/tickets.js`.
+- Ticket embeds → `src/embeds.js` (`buildPanelEmbed`, `buildTicketOpenEmbed`, …).
+- Slash command defs → `src/deploy-commands.js`.
+- Button + command routing → `src/index.js`.
+
+To add a ticket type, add an entry to `TICKET_TYPES` and `TYPE_ORDER` in
+`src/tickets.js` — the panel, categories, and routing pick it up automatically.
 
 ---
 

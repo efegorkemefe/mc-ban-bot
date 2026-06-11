@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { REST, Routes, SlashCommandBuilder } = require('discord.js');
+const { REST, Routes, SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
 
 const SEVERITY_CHOICES = [
   { name: 'LOW', value: 'LOW' },
@@ -74,6 +74,81 @@ const commands = [
     .setName('lookup-war')
     .setDescription('Look up war/raid records by team')
     .addStringOption(o => o.setName('team').setDescription('Team / player name to search for').setRequired(true))
+    .toJSON(),
+
+  // ── Ticket system ───────────────────────────────────────────────────────────
+  // /ticket-panel — admins post the control panel (auto-creates categories).
+  new SlashCommandBuilder()
+    .setName('ticket-panel')
+    .setDescription('Post the ticket control panel in this channel (admin only)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .setDMPermission(false)
+    .toJSON(),
+
+  // /add — add a user to the current ticket. (Access is gated in-code by role.)
+  new SlashCommandBuilder()
+    .setName('add')
+    .setDescription('Add a user to this ticket')
+    .setDMPermission(false)
+    .addUserOption(o => o.setName('user').setDescription('The user to add').setRequired(true))
+    .toJSON(),
+
+  // /remove — remove a user from the current ticket.
+  new SlashCommandBuilder()
+    .setName('remove')
+    .setDescription('Remove a user from this ticket')
+    .setDMPermission(false)
+    .addUserOption(o => o.setName('user').setDescription('The user to remove').setRequired(true))
+    .toJSON(),
+
+  // /claim — claim the current ticket (locks out other regular staff).
+  new SlashCommandBuilder()
+    .setName('claim')
+    .setDescription('Claim this ticket so only you and senior staff can respond')
+    .setDMPermission(false)
+    .toJSON(),
+
+  // /unclaim — release a claimed ticket.
+  new SlashCommandBuilder()
+    .setName('unclaim')
+    .setDescription('Release this ticket so all staff can respond again')
+    .setDMPermission(false)
+    .toJSON(),
+
+  // /rename — rename the current ticket channel.
+  new SlashCommandBuilder()
+    .setName('rename')
+    .setDescription('Rename this ticket channel')
+    .setDMPermission(false)
+    .addStringOption(o => o.setName('name').setDescription('The new channel name').setRequired(true))
+    .toJSON(),
+
+  // /close — archive (transcript) and delete the current ticket.
+  new SlashCommandBuilder()
+    .setName('close')
+    .setDescription('Close this ticket (saves a transcript, then deletes the channel)')
+    .setDMPermission(false)
+    .addStringOption(o => o.setName('reason').setDescription('Optional reason for closing').setRequired(false))
+    .toJSON(),
+
+  // /wl-accept — manually approve a whitelist applicant and grant the member role.
+  new SlashCommandBuilder()
+    .setName('wl-accept')
+    .setDescription('Approve a whitelist applicant and give them the member role')
+    .setDMPermission(false)
+    .addUserOption(o => o.setName('user').setDescription('The user to whitelist').setRequired(true))
+    .toJSON(),
+
+  // /help — command reference.
+  new SlashCommandBuilder()
+    .setName('help')
+    .setDescription('Show how to use the bot and list available commands')
+    .toJSON(),
+
+  // /ping — bot status / health.
+  new SlashCommandBuilder()
+    .setName('ping')
+    .setDescription('Check the bot status, latency, and uptime')
     .toJSON(),
 ];
 

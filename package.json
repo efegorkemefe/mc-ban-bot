@@ -1,15 +1,28 @@
 {
   "name": "mc-ban-bot",
-  "version": "1.0.0",
-  "description": "Minecraft server ban logging Discord bot",
+  "version": "1.1.0",
+  "description": "All-in-one Minecraft community Discord bot: ban/war logging, a category-based ticket system with claiming and transcripts, and AI-assisted whitelist applications.",
   "main": "src/index.js",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node src/index.js",
     "deploy": "node src/deploy-commands.js"
   },
+  "keywords": [
+    "discord",
+    "discord-bot",
+    "minecraft",
+    "tickets",
+    "moderation",
+    "whitelist"
+  ],
+  "license": "MIT",
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.71.2",
     "discord.js": "^14.14.1",
-    "googleapis": "^140.0.0",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "googleapis": "^140.0.0"
   }
 }
