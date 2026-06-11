@@ -22,7 +22,10 @@ const {
   buildTicketUnclaimEmbed,
   buildTicketNoticeEmbed,
   buildWhitelistReviewEmbed,
-  buildHelpEmbed,
+  buildHelpPanelEmbed,
+  buildMemberGuideEmbed,
+  buildStaffGuideEmbed,
+  buildTicketRulesEmbed,
   buildStatusEmbed,
   buildBanListEmbed,
   buildUnbanEmbed,
@@ -185,6 +188,7 @@ client.on(Events.InteractionCreate, async interaction => {
     if (interaction.isButton()) {
       if (interaction.customId.startsWith('ticket:')) return await handleTicketButton(interaction);
       if (interaction.customId.startsWith('pg:')) return await handlePaginatorButton(interaction);
+      if (interaction.customId.startsWith('help:')) return await handleHelpButton(interaction);
       return;
     }
 
@@ -211,6 +215,7 @@ client.on(Events.InteractionCreate, async interaction => {
       case 'close':         return await handleTicketClose(interaction);
       case 'wl-accept':     return await handleWlAccept(interaction);
       case 'help':          return await handleHelp(interaction);
+      case 'help-panel':    return await handleHelpPanel(interaction);
       case 'ping':          return await handlePing(interaction);
     }
   } catch (err) {
@@ -1091,10 +1096,39 @@ async function handleLookupWar(interaction) {
   await replyPaginated(interaction, embeds, `Found **${matches.length}** record(s) for \`${team}\`:`);
 }
 
-// ── /help ─────────────────────────────────────────────────────────────────────
+// ── Help Center (/help, /help-panel) ────────────────────────────────────────────
+// The three guide buttons shown on the help panel.
+function helpPanelComponents() {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('help:member').setLabel('Member Guide').setEmoji('📖').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('help:staff').setLabel('Staff Guide').setEmoji('🛠️').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('help:rules').setLabel('Ticket Rules').setEmoji('🎫').setStyle(ButtonStyle.Secondary),
+  )];
+}
+
+// /help — show the help center to the person who ran it (ephemeral).
 async function handleHelp(interaction) {
-  const staff = tickets.isStaff(interaction.member);
-  return interaction.reply({ embeds: [buildHelpEmbed({ isStaff: staff })], ephemeral: true });
+  return interaction.reply({ embeds: [buildHelpPanelEmbed()], components: helpPanelComponents(), ephemeral: true });
+}
+
+// /help-panel — admins post the help center publicly in the current channel.
+async function handleHelpPanel(interaction) {
+  if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+    return interaction.reply({ content: '❌ You need the **Manage Server** permission to post the help panel.', ephemeral: true });
+  }
+  await interaction.deferReply({ ephemeral: true });
+  await interaction.channel.send({ embeds: [buildHelpPanelEmbed()], components: helpPanelComponents() });
+  return interaction.editReply('✅ Help panel posted.');
+}
+
+// Guide buttons → reply privately with the chosen tutorial (works on both the
+// public panel and the ephemeral /help message).
+async function handleHelpButton(interaction) {
+  const which = interaction.customId.split(':')[1];
+  const embed = which === 'staff' ? buildStaffGuideEmbed()
+    : which === 'rules' ? buildTicketRulesEmbed()
+      : buildMemberGuideEmbed();
+  return interaction.reply({ embeds: [embed], ephemeral: true });
 }
 
 // ── /ping ─────────────────────────────────────────────────────────────────────

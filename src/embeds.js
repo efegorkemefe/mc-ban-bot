@@ -540,64 +540,176 @@ function buildTicketInactivityEmbed({ idleHours, closeHours }) {
     .setTimestamp();
 }
 
-// ── /help ───────────────────────────────────────────────────────────────────────
-function buildHelpEmbed({ isStaff }) {
-  const embed = new EmbedBuilder()
+// ── Help Center ─────────────────────────────────────────────────────────────────
+// The landing panel (posted by /help-panel or shown by /help). The buttons that
+// open each guide are built in src/index.js (helpPanelComponents).
+function buildHelpPanelEmbed() {
+  return new EmbedBuilder()
     .setColor(BRAND_COLOR)
-    .setAuthor(brandAuthor(`❓ ${BRAND_NAME} · Help`))
+    .setAuthor(brandAuthor(`❓ ${BRAND_NAME} · Help Center`))
     .setTitle('How can we help?')
     .setDescription(
-      'Use the **ticket panel** to open a private channel with our team — pick the category ' +
-      'that fits your request (support, reports, applications, and more).',
+      `Welcome to the **${BRAND_NAME}** help center! Pick a guide below — it opens just for you ` +
+      '(only you can see it).\n\n' +
+      '📖 **Member Guide** — how to open tickets, apply for whitelist, and appeal a ban.\n' +
+      '🛠️ **Staff Guide** — moderation logging, ticket management, and whitelist tools.\n' +
+      '🎫 **Ticket Rules** — the rules for every ticket type and how tickets work.',
     )
+    .setFooter(brandFooter(`${BRAND_NAME} • Choose a guide below`))
+    .setTimestamp();
+}
+
+// Tutorial for regular members.
+function buildMemberGuideEmbed() {
+  return new EmbedBuilder()
+    .setColor(BRAND_COLOR)
+    .setAuthor(brandAuthor(`📖 ${BRAND_NAME} · Member Guide`))
+    .setTitle('Using the bot as a member')
+    .setDescription('Everything you need to get help, apply, or appeal — step by step.')
     .addFields(
       {
         name: '🎫 Opening a ticket',
-        value: 'Click a button on the ticket panel. You can have **one open ticket at a time**. ' +
-          'For whitelist applications, post your details and press **Submit for Review**.',
+        value:
+          '1. Find the **ticket panel** and click the button for what you need.\n' +
+          '2. A **private channel** opens for you and the staff team.\n' +
+          '3. Describe your request clearly — add screenshots/your IGN if relevant.\n' +
+          '> You can only have **one open ticket at a time**, server-wide.',
         inline: false,
       },
       {
-        name: '🔎 Banned? Find your Ban ID',
-        value: 'Run **`/findban <username>`** to look up your Ban ID, then open a **⚖️ Ban Appeal** ' +
-          'ticket and give that ID to staff.',
+        name: '📝 Applying for the whitelist',
+        value:
+          '1. Open a **Whitelist Application** ticket.\n' +
+          '2. Post your **IGN**, **age**, whether you own an **original copy** of Minecraft, and **why** you want to join.\n' +
+          '3. Click **📨 Submit for Review** — you may be approved automatically, or sent to staff.\n' +
+          '4. If not approved, use **Appeal Decision** to have a human review it.',
         inline: false,
       },
-    );
+      {
+        name: '⚖️ Appealing a ban',
+        value:
+          '1. Run **`/findban <your username>`** to get your **Ban ID**.\n' +
+          '2. Open a **⚖️ Ban Appeal** ticket and enter that Ban ID.\n' +
+          '3. Click **🔍 Look Up Ban** so staff can see your record, then explain your appeal.',
+        inline: false,
+      },
+      {
+        name: '💬 Good to know',
+        value:
+          '• Be patient and respectful — staff get a ping when your ticket opens.\n' +
+          '• Quiet tickets may be auto-closed; send a message to keep yours open.\n' +
+          '• Run **`/ping`** any time to check the bot is online.',
+        inline: false,
+      },
+    )
+    .setFooter(brandFooter(BRAND_NAME))
+    .setTimestamp();
+}
 
-  if (isStaff) {
-    embed.addFields(
+// Tutorial for staff.
+function buildStaffGuideEmbed() {
+  return new EmbedBuilder()
+    .setColor(BRAND_COLOR)
+    .setAuthor(brandAuthor(`🛠️ ${BRAND_NAME} · Staff Guide`))
+    .setTitle('Using the bot as staff')
+    .setDescription('Your toolkit for moderation logging and ticket handling.')
+    .addFields(
       {
-        name: '🛠️ Ticket commands (staff)',
-        value: [
-          '`/ticket-panel` — post the ticket panel (admin)',
-          '`/claim` · `/unclaim` — claim or release a ticket',
-          '`/add` · `/remove` — manage who can see a ticket',
-          '`/rename` — rename a ticket channel',
-          '`/close` — archive + close a ticket',
-        ].join('\n'),
+        name: '🔨 Logging bans',
+        value:
+          '`/log-ban` — fill in the fields, then **upload screenshot evidence** in the channel and type `done` ' +
+          '(or wait 2 min). The ID is assigned automatically; HIGH/CRITICAL/PERMANENT pings senior staff. ' +
+          'Evidence is re-hosted permanently.',
         inline: false,
       },
       {
-        name: '📝 Whitelist (staff)',
-        value: '`/wl-accept <user>` — approve an applicant and grant the member role',
+        name: '📂 Appeals & unbans',
+        value:
+          '`/update-appeal <id> <status>` — set Appealable / Unappealable / N/A.\n' +
+          '`/unban <id> [reason]` — mark a ban **lifted** and announce it in the ban log.',
         inline: false,
       },
       {
-        name: '🔨 Moderation logging (staff)',
-        value: [
-          '`/log-ban` · `/lookup-ban` · `/banlist`',
-          '`/update-appeal` · `/unban` · `/history`',
-          '`/log-war` · `/lookup-war` · `/stats`',
-        ].join('\n'),
+        name: '🔍 Lookups & analytics',
+        value:
+          '`/lookup-ban` — by ID or player (shows when it ends).\n' +
+          '`/banlist` — active or all bans, paged.\n' +
+          '`/history <player>` — a player\'s full ban timeline.\n' +
+          '`/stats` — server dashboard.  ·  `/lookup-war` — war/raid records.',
         inline: false,
       },
-      { name: '🩺 Utility', value: '`/help` · `/ping`', inline: false },
-    );
-  }
+      {
+        name: '🎫 Managing tickets',
+        value:
+          '`/claim` / `/unclaim` — lock a ticket to you + senior staff.\n' +
+          '`/add` / `/remove` — control who can see it.\n' +
+          '`/rename` — rename the channel.  ·  `/close [reason]` — archive (transcript) + delete.',
+        inline: false,
+      },
+      {
+        name: '📝 Whitelist & war logging',
+        value:
+          '`/wl-accept <user>` — approve an applicant and grant the member role.\n' +
+          '`/log-war` — log a war/raid approval.',
+        inline: false,
+      },
+      {
+        name: '⚙️ Permissions',
+        value:
+          'The bot needs **Manage Channels** (create tickets) and **Manage Roles** (claim/add and grant ' +
+          'the member role). Its role must sit **above** the ticket/member roles.',
+        inline: false,
+      },
+    )
+    .setFooter(brandFooter(BRAND_NAME))
+    .setTimestamp();
+}
 
-  embed.setFooter(brandFooter(BRAND_NAME)).setTimestamp();
-  return embed;
+// Explains the ticket types + how tickets behave.
+function buildTicketRulesEmbed() {
+  return new EmbedBuilder()
+    .setColor(BRAND_COLOR)
+    .setAuthor(brandAuthor(`🎫 ${BRAND_NAME} · Ticket Rules`))
+    .setTitle('How tickets work & the rules')
+    .addFields(
+      {
+        name: '📋 The basics',
+        value:
+          '• **One open ticket at a time** per person, across all categories.\n' +
+          '• Pick the **correct category** for your request — wrong-category tickets may be closed.\n' +
+          '• Be respectful and provide details; staff handle tickets as soon as they can.\n' +
+          '• Don\'t open joke/empty tickets or re-open to "bump" — it slows everyone down.',
+        inline: false,
+      },
+      {
+        name: '🗂️ The ticket types',
+        value:
+          '📝 **Whitelist Application** — apply to join.\n' +
+          '🎫 **General Support** — questions / issues.\n' +
+          '⚔️ **War / Raid Request** — get a war or raid approved.\n' +
+          '🚩 **Member Report** — report a rule-breaking player.\n' +
+          '⚖️ **Ban Appeal** — appeal a ban (have your Ban ID ready).\n' +
+          '🛡️ **Staff Report** — report a staff member (senior staff only).\n' +
+          '🪖 **Staff Application** — apply to join staff (after a minimum time in the server).',
+        inline: false,
+      },
+      {
+        name: '🙋 Claiming & privacy',
+        value:
+          'Tickets are **private** — only you and staff can see yours. When a staffer **claims** a ticket, ' +
+          'only they and senior staff reply from then on, so you get one consistent handler.',
+        inline: false,
+      },
+      {
+        name: '🔒 Closing & inactivity',
+        value:
+          'Closing a ticket saves a **transcript** for staff records, then deletes the channel. ' +
+          'Inactive tickets may be **auto-closed** after a warning — just reply to keep yours open.',
+        inline: false,
+      },
+    )
+    .setFooter(brandFooter(BRAND_NAME))
+    .setTimestamp();
 }
 
 // ── /stats ────────────────────────────────────────────────────────────────────
@@ -659,7 +771,10 @@ module.exports = {
   buildTicketNoticeEmbed,
   buildTicketClosingEmbed,
   buildTicketCloseLogEmbed,
-  buildHelpEmbed,
+  buildHelpPanelEmbed,
+  buildMemberGuideEmbed,
+  buildStaffGuideEmbed,
+  buildTicketRulesEmbed,
   buildStatusEmbed,
   buildBanListEmbed,
   buildUnbanEmbed,

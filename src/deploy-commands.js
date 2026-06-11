@@ -181,7 +181,15 @@ const commands = [
   // /help — command reference.
   new SlashCommandBuilder()
     .setName('help')
-    .setDescription('Show how to use the bot and list available commands')
+    .setDescription('Open the help center (member & staff guides, ticket rules)')
+    .toJSON(),
+
+  // /help-panel — admins post the public help center.
+  new SlashCommandBuilder()
+    .setName('help-panel')
+    .setDescription('Post the public help panel (member + staff guides, ticket rules)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .setDMPermission(false)
     .toJSON(),
 
   // /ping — bot status / health.

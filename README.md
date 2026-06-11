@@ -67,7 +67,8 @@ Two Google Sheet tabs are used inside one spreadsheet:
 | Command | Who | What it does |
 |---------|-----|--------------|
 | `/findban` | Everyone | A banned player looks up **their own Ban ID** by username (to give staff when appealing). |
-| `/help` | Everyone | Shows how to use the bot; lists staff commands for staff. |
+| `/help` | Everyone | Opens the **help center** — buttons for the Member Guide, Staff Guide, and Ticket Rules (private to you). |
+| `/help-panel` | Admin (Manage Server) | Posts the help center **publicly** in the current channel so everyone can use the guide buttons. |
 | `/ping` | Everyone | Bot status — latency, uptime, and open-ticket count. |
 
 ### The `/log-ban` evidence flow
