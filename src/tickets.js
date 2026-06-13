@@ -27,6 +27,7 @@ const {
   buildTicketClosingEmbed,
   buildTicketCloseLogEmbed,
   buildTicketInactivityEmbed,
+  applyPriorityToOpenEmbed,
 } = require('./embeds');
 
 // ── Config (from .env) ────────────────────────────────────────────────────────
@@ -40,6 +41,23 @@ const TICKET_LOG_CHANNEL_ID = process.env.TICKET_LOG_CHANNEL_ID || '';
 const STAFF_APP_MIN_DAYS = parseInt(process.env.STAFF_APP_MIN_DAYS || '7', 10);
 // Role granted to whitelisted members (on AI approval or /wl-accept).
 const MEMBER_ROLE_ID = process.env.MEMBER_ROLE_ID || '';
+// Extra "verified" role granted alongside the member role. Defaults to the member
+// role so the feature is a no-op until a distinct role is configured.
+const VERIFIED_ROLE_ID = process.env.VERIFIED_ROLE_ID || MEMBER_ROLE_ID;
+
+// ── Ticket priority levels ──────────────────────────────────────────────────
+// `prefix` is prepended to the channel name (combined with the CLM- claim prefix,
+// e.g. CLM-URG-ban-appeal-0012). Normal carries no prefix.
+const PRIORITIES = {
+  low:    { label: 'Low',    emoji: '🔽', prefix: 'low-', color: 0x768390 },
+  normal: { label: 'Normal', emoji: '⏺️', prefix: '',     color: 0x5865f2 },
+  urgent: { label: 'Urgent', emoji: '🔴', prefix: 'URG-', color: 0xe84343 },
+};
+
+function priorityLabel(level) {
+  const p = PRIORITIES[level] || PRIORITIES.normal;
+  return `${p.emoji} ${p.label}`;
+}
 
 // ── Ticket type definitions ────────────────────────────────────────────────────
 // `short`     → channel-name prefix (e.g. support-0001)
@@ -185,9 +203,14 @@ function guildCfg(store, guildId) {
   if (!store.guilds[guildId]) {
     store.guilds[guildId] = { categories: {}, counters: {}, panelChannelId: null, claims: {}, inactivity: {} };
   }
-  if (!store.guilds[guildId].claims) store.guilds[guildId].claims = {};
-  if (!store.guilds[guildId].inactivity) store.guilds[guildId].inactivity = {};
-  return store.guilds[guildId];
+  const g = store.guilds[guildId];
+  if (!g.claims) g.claims = {};
+  if (!g.inactivity) g.inactivity = {};
+  if (!g.priorities) g.priorities = {};
+  if (!g.openMsgId) g.openMsgId = {};
+  if (!g.closedTickets) g.closedTickets = [];
+  if (!g.meta) g.meta = {};
+  return g;
 }
 
 // ── Claim state (kept in the local store, NOT the channel topic) ────────────────
@@ -210,6 +233,88 @@ function setClaim(guildId, channelId, claimerId) {
 // Convenience for callers that have the channel object.
 function getClaimedBy(channel) {
   return channel?.guild ? getClaim(channel.guild.id, channel.id) : null;
+}
+
+// ── Priority state (local store) ────────────────────────────────────────────
+function getPriority(guildId, channelId) {
+  return guildCfg(loadStore(), guildId).priorities[channelId] || 'normal';
+}
+
+function setPriority(guildId, channelId, level) {
+  const store = loadStore();
+  const cfg = guildCfg(store, guildId);
+  if (level && level !== 'normal') cfg.priorities[channelId] = level;
+  else delete cfg.priorities[channelId];
+  saveStore(store);
+}
+
+// Computes the channel name for a priority level, preserving the CLM- claim
+// prefix and swapping any existing priority prefix. Capped to Discord's limit.
+function priorityChannelName(currentName, level) {
+  let name = String(currentName || '');
+  let claim = '';
+  if (name.startsWith('CLM-')) { claim = 'CLM-'; name = name.slice(4); }
+  for (const p of Object.values(PRIORITIES)) {
+    if (p.prefix && name.startsWith(p.prefix)) { name = name.slice(p.prefix.length); break; }
+  }
+  const prefix = (PRIORITIES[level] || PRIORITIES.normal).prefix;
+  return `${claim}${prefix}${name}`.slice(0, 100);
+}
+
+// Edits the ticket's opening message to reflect the current priority. Uses the
+// stored opening-message id, falling back to scanning recent bot messages.
+async function updateOpenEmbedPriority(channel, clientUserId, level) {
+  if (!channel?.guild) return;
+  const msgId = guildCfg(loadStore(), channel.guild.id).openMsgId[channel.id];
+  let msg = msgId ? await channel.messages.fetch(msgId).catch(() => null) : null;
+  if (!msg) {
+    const batch = await channel.messages.fetch({ limit: 50 }).catch(() => null);
+    if (batch) {
+      msg = [...batch.values()].reverse()
+        .find(m => m.author.id === clientUserId && m.embeds.length && m.components.length);
+    }
+  }
+  if (!msg || !msg.embeds.length) return;
+  const eb = applyPriorityToOpenEmbed(msg.embeds[0], priorityLabel(level));
+  await msg.edit({ embeds: [eb] }).catch(() => {});
+}
+
+// ── Closed-ticket log + scheduler bookkeeping (local store) ─────────────────
+function recordClosedTicket(guildId, channelId, rec) {
+  const store = loadStore();
+  const cfg = guildCfg(store, guildId);
+  cfg.closedTickets.push(rec);
+  if (cfg.closedTickets.length > 1000) cfg.closedTickets = cfg.closedTickets.slice(-1000);
+  delete cfg.priorities[channelId];
+  delete cfg.openMsgId[channelId];
+  if (cfg.meta.appealReminders) delete cfg.meta.appealReminders[channelId];
+  saveStore(store);
+}
+
+function getClosedTickets(guildId) {
+  return guildCfg(loadStore(), guildId).closedTickets || [];
+}
+
+function getAppealReminderAt(guildId, channelId) {
+  return guildCfg(loadStore(), guildId).meta.appealReminders?.[channelId] || null;
+}
+
+function setAppealReminderAt(guildId, channelId, ts) {
+  const store = loadStore();
+  const cfg = guildCfg(store, guildId);
+  cfg.meta.appealReminders = cfg.meta.appealReminders || {};
+  cfg.meta.appealReminders[channelId] = ts;
+  saveStore(store);
+}
+
+function getLastWeeklyReport(guildId) {
+  return guildCfg(loadStore(), guildId).meta.lastWeeklyReport || null;
+}
+
+function setLastWeeklyReport(guildId, isoMonday) {
+  const store = loadStore();
+  guildCfg(store, guildId).meta.lastWeeklyReport = isoMonday;
+  saveStore(store);
 }
 
 // ── Role helpers ────────────────────────────────────────────────────────────────
@@ -483,11 +588,35 @@ async function collectApplicationText(channel, ownerId) {
 
 // Grants the configured member role. Returns { ok } or { ok: false, error }.
 async function giveMemberRole(guild, userId) {
+  return grantWhitelist(guild, userId);
+}
+
+// Approves a whitelist applicant: grants the member role (and the verified role,
+// if a distinct one is configured) and, when an IGN is supplied, sets their
+// server nickname to it. Nickname failures (missing permission, server owner)
+// are logged and skipped — they never fail the approval. Returns
+// { ok, nickname } or { ok: false, error }.
+async function grantWhitelist(guild, userId, { ign } = {}) {
   if (!MEMBER_ROLE_ID) return { ok: false, error: 'MEMBER_ROLE_ID is not configured in .env.' };
   try {
     const member = await guild.members.fetch(userId);
-    await member.roles.add(MEMBER_ROLE_ID);
-    return { ok: true };
+
+    const roleIds = [MEMBER_ROLE_ID];
+    if (VERIFIED_ROLE_ID && VERIFIED_ROLE_ID !== MEMBER_ROLE_ID && validRoleIds(guild, [VERIFIED_ROLE_ID]).length) {
+      roleIds.push(VERIFIED_ROLE_ID);
+    }
+    await member.roles.add(roleIds);
+
+    let nickname = null;
+    if (ign) {
+      try {
+        await member.setNickname(String(ign).slice(0, 32));
+        nickname = ign;
+      } catch (err) {
+        console.warn(`⚠️ Could not set nickname for ${userId} → "${ign}" (server owner or missing Manage Nicknames):`, err.message);
+      }
+    }
+    return { ok: true, nickname };
   } catch (err) {
     return { ok: false, error: err.message };
   }
@@ -560,12 +689,17 @@ async function createTicket(guild, member, typeKey, options = {}) {
   const uniqueRoles = [...new Set(roleMentions)];
   for (const r of uniqueRoles) mentions.push(`<@&${r}>`);
 
-  await channel.send({
+  const openMsg = await channel.send({
     content: mentions.join(' '),
     embeds: [buildTicketOpenEmbed(t, `<@${member.id}>`, t.prompt)],
     components: ticketControlComponents(false, typeKey),
     allowedMentions: { users: [member.id], roles: uniqueRoles },
   });
+
+  // Remember the opening message so /priority can update its embed later.
+  const store2 = loadStore();
+  guildCfg(store2, guild.id).openMsgId[channel.id] = openMsg.id;
+  saveStore(store2);
 
   return { ok: true, channel };
 }
@@ -636,7 +770,7 @@ async function removeUserFromTicket(channel, userId) {
 }
 
 // ── Transcript + close ──────────────────────────────────────────────────────────
-async function buildTranscript(channel) {
+async function buildTranscript(channel, ownerId = null) {
   const all = [];
   let before;
   for (let i = 0; i < 10; i++) { // up to 1000 messages
@@ -648,6 +782,16 @@ async function buildTranscript(channel) {
   }
   all.reverse();
 
+  // First-response time: the earliest non-bot message from someone other than the
+  // owner (in a private ticket that is effectively the first staff reply).
+  let firstResponseAt = null;
+  for (const m of all) {
+    if (m.author.bot) continue;
+    if (ownerId && m.author.id === ownerId) continue;
+    firstResponseAt = m.createdTimestamp;
+    break;
+  }
+
   const lines = all.map(m => {
     const time = new Date(m.createdTimestamp).toISOString().replace('T', ' ').slice(0, 19);
     let content = m.content || '';
@@ -658,7 +802,7 @@ async function buildTranscript(channel) {
     return `[${time} UTC] ${m.author.tag}: ${content}`.trimEnd();
   });
 
-  return { text: lines.join('\n'), count: all.length };
+  return { text: lines.join('\n'), count: all.length, firstResponseAt };
 }
 
 function humanizeDuration(ms) {
@@ -681,8 +825,24 @@ async function closeTicket(channel, closedByMember, reason, client) {
   const claimedBy = channel.guild ? getClaim(channel.guild.id, channel.id) : null;
   if (channel.guild) setClaim(channel.guild.id, channel.id, null); // clean up state
 
-  const { text, count } = await buildTranscript(channel);
+  const { text, count, firstResponseAt } = await buildTranscript(channel, meta.ownerId);
   const opened = channel.createdTimestamp;
+
+  // Record stats for the weekly staff report (best-effort; also cleans up the
+  // ticket's local state). The bot itself closing (auto-close) is recorded too,
+  // but counts toward no staffer because closedByName is omitted for the bot.
+  if (channel.guild) {
+    recordClosedTicket(channel.guild.id, channel.id, {
+      type: meta.type || 'unknown',
+      ownerId: meta.ownerId || null,
+      claimedBy: claimedBy || null,
+      closedBy: closedByMember.id,
+      closedByName: closedByMember.displayName || null,
+      openedAt: new Date(opened).toISOString(),
+      closedAt: new Date().toISOString(),
+      firstResponseMs: firstResponseAt ? (firstResponseAt - opened) : null,
+    });
+  }
 
   const info = {
     channelName: channel.name,
@@ -799,6 +959,8 @@ async function sweepInactiveTickets(guild, client, { warnHours, closeHours }) {
 
 module.exports = {
   TICKET_TYPES,
+  PRIORITIES,
+  priorityLabel,
   isStaff,
   isSenior,
   encodeTopic,
@@ -819,8 +981,18 @@ module.exports = {
   findAnyOpenTicketByUser,
   collectApplicationText,
   giveMemberRole,
+  grantWhitelist,
   staffPingRoleIds,
   countOpenTickets,
   getClaimedBy,
   sweepInactiveTickets,
+  getPriority,
+  setPriority,
+  priorityChannelName,
+  updateOpenEmbedPriority,
+  getClosedTickets,
+  getAppealReminderAt,
+  setAppealReminderAt,
+  getLastWeeklyReport,
+  setLastWeeklyReport,
 };

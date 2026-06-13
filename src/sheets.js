@@ -4,6 +4,9 @@ const path = require('path');
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 const BAN_SHEET_NAME = process.env.BAN_SHEET_NAME || 'Ban Logs';
 const WAR_SHEET_NAME = process.env.WAR_SHEET_NAME || 'War & Raid Approvals';
+// Tab that records verified Minecraft accounts (IGN ↔ UUID ↔ Discord). Created
+// automatically on first write if it doesn't exist yet.
+const VERIFIED_SHEET_NAME = process.env.VERIFIED_SHEET_NAME || 'Verified Players';
 
 // Real logs live BELOW the example rows + divider. Both tabs have a title row,
 // a header row, three [EXAMPLE] rows, then a divider — so real data starts at
@@ -425,6 +428,68 @@ function rowToWar(row = []) {
   };
 }
 
+// ── Verified Players sheet (Minecraft IGN ↔ UUID verification) ──────────────────
+// Columns: A Discord ID | B Discord Tag | C Minecraft IGN | D UUID | E Verified At.
+// The tab is created (with a header row) the first time we need to write to it.
+
+async function ensureVerifiedSheet() {
+  const sheets = await getSheetsClient();
+  let sheetId = await getSheetId(VERIFIED_SHEET_NAME);
+  if (sheetId !== undefined) return sheetId;
+
+  const addRes = await withRetry(() => sheets.spreadsheets.batchUpdate({
+    spreadsheetId: SPREADSHEET_ID,
+    requestBody: { requests: [{ addSheet: { properties: { title: VERIFIED_SHEET_NAME } } }] },
+  }));
+  sheetId = addRes.data.replies?.[0]?.addSheet?.properties?.sheetId;
+  if (_sheetIdCache) _sheetIdCache[VERIFIED_SHEET_NAME] = sheetId;
+
+  await withRetry(() => sheets.spreadsheets.values.update({
+    spreadsheetId: SPREADSHEET_ID,
+    range: range(VERIFIED_SHEET_NAME, 'A1:E1'),
+    valueInputOption: 'RAW',
+    requestBody: { values: [['Discord ID', 'Discord Tag', 'Minecraft IGN', 'UUID', 'Verified At']] },
+  }));
+  return sheetId;
+}
+
+// Records (or updates, matched by Discord ID) a verified player. Best-effort:
+// callers should catch and log so a sheet hiccup never blocks approval.
+async function recordVerifiedPlayer({ discordId, discordTag = '', ign, uuid }) {
+  await ensureVerifiedSheet();
+  const sheets = await getSheetsClient();
+
+  const res = await withRetry(() => sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: range(VERIFIED_SHEET_NAME, 'A2:E'),
+  }));
+  const rows = res.data.values || [];
+  const row = [String(discordId || ''), discordTag, ign || '', uuid || '', new Date().toISOString()];
+
+  let rowIndex = null;
+  for (let i = 0; i < rows.length; i++) {
+    if (String(rows[i][0] || '') === String(discordId)) { rowIndex = i + 2; break; }
+  }
+
+  if (rowIndex) {
+    await withRetry(() => sheets.spreadsheets.values.update({
+      spreadsheetId: SPREADSHEET_ID,
+      range: range(VERIFIED_SHEET_NAME, `A${rowIndex}:E${rowIndex}`),
+      valueInputOption: 'RAW',
+      requestBody: { values: [row] },
+    }));
+  } else {
+    await withRetry(() => sheets.spreadsheets.values.append({
+      spreadsheetId: SPREADSHEET_ID,
+      range: range(VERIFIED_SHEET_NAME, 'A2:E'),
+      valueInputOption: 'RAW',
+      insertDataOption: 'INSERT_ROWS',
+      requestBody: { values: [row] },
+    }));
+  }
+  return true;
+}
+
 module.exports = {
   normalizeBanId,
   formatBanId,
@@ -439,4 +504,7 @@ module.exports = {
   getWarRows,
   findWarsByTeam,
   rowToWar,
+  VERIFIED_SHEET_NAME,
+  ensureVerifiedSheet,
+  recordVerifiedPlayer,
 };

@@ -388,7 +388,7 @@ function buildPanelEmbed(types, guildIcon) {
 // The opening message posted inside a freshly-created ticket channel. When
 // `submitted` is true (e.g. an application collected via a modal), the body
 // acknowledges the submission instead of asking the user to provide details.
-function buildTicketOpenEmbed(type, ownerMention, prompt, submitted = false) {
+function buildTicketOpenEmbed(type, ownerMention, prompt, submitted = false, priorityText = '⏺️ Normal') {
   const body = submitted
     ? `Welcome ${ownerMention}! Your application has been received and is shown below. ` +
       `Our staff team has been notified and will review it shortly.`
@@ -405,9 +405,23 @@ function buildTicketOpenEmbed(type, ownerMention, prompt, submitted = false) {
       { name: '🏷️ Category',  value: `\`${type.label}\``, inline: true },
       { name: '🙋 Opened By',  value: ownerMention, inline: true },
       { name: '📌 Status',     value: '🟢 Open · Unclaimed', inline: true },
+      { name: '🚦 Priority',   value: priorityText, inline: true },
     )
     .setFooter(brandFooter(`${TICKET_BRAND} • Use the buttons below to manage this ticket`))
     .setTimestamp();
+}
+
+// Returns a copy of an existing ticket-open embed with its Priority field set to
+// `priorityLabel` (inserting the field if it isn't present). Used by /priority.
+function applyPriorityToOpenEmbed(rawEmbed, priorityLabel) {
+  const eb = EmbedBuilder.from(rawEmbed);
+  const fields = (eb.data.fields || []).slice();
+  const field = { name: '🚦 Priority', value: priorityLabel, inline: true };
+  const idx = fields.findIndex(f => f.name && f.name.includes('Priority'));
+  if (idx >= 0) fields[idx] = field;
+  else fields.push(field);
+  eb.setFields(fields);
+  return eb;
 }
 
 // Renders the AI reviewer's verdict on a whitelist application.
@@ -584,6 +598,14 @@ function buildMemberPanel(guildIcon) {
         inline: false,
       },
       {
+        name: '🎮 Username check & nickname',
+        value:
+          '• Your **IGN is verified against Mojang** when you submit — make sure it\'s spelled **exactly** right, ' +
+          'or you\'ll be asked to resubmit.\n' +
+          '• When you\'re approved, your **server nickname is set to your IGN** automatically.',
+        inline: false,
+      },
+      {
         name: '⚖️ Appealing a ban',
         value:
           '1️⃣ Run **`/findban <your IGN>`** to get your **Ban ID**.\n' +
@@ -606,6 +628,13 @@ function buildMemberPanel(guildIcon) {
           '• Be **respectful and patient**; staff are pinged the moment your ticket opens.\n' +
           '• **No** joke, empty, or duplicate tickets.\n' +
           '• Quiet tickets may be **auto-closed** after a warning — just reply to keep yours open.',
+        inline: false,
+      },
+      {
+        name: '⚠️ Warnings',
+        value:
+          'Breaking the rules can earn a **formal warning** — you\'ll get a **DM** explaining why. ' +
+          'Warnings add up, and enough of them can lead to a ban, so check your DMs and follow staff guidance.',
         inline: false,
       },
     )
@@ -664,19 +693,85 @@ function buildStaffPanel(guildIcon) {
         value:
           '**`/claim`** / **`/unclaim`** — lock a ticket to you + senior staff.\n' +
           '**`/add`** / **`/remove`** — control who can see it.\n' +
+          '**`/priority <Low|Normal|Urgent>`** — set priority (renames the channel; Urgent pings seniors).\n' +
           '**`/rename`** — rename the channel.  ·  **`/close [reason]`** — save a transcript, then delete.',
         inline: false,
       },
       {
         name: '📝 Whitelist & panels',
         value:
-          '**`/wl-accept <user>`** — approve an applicant and grant the member role.\n' +
+          '**`/wl-accept <user>`** — approve an applicant and grant the member role (sets nickname to a verified IGN).\n' +
           '**`/log-war`** — log a war/raid approval.\n' +
           '**`/ticket-panel`** — post the ticket panel.  ·  **`/info-panel`** / **`/staff-panel`** — post these boards.',
         inline: false,
       },
     )
     .setFooter(brandFooter(`${BRAND_NAME} • Staff reference`))
+    .setTimestamp();
+
+  const moderation = new EmbedBuilder()
+    .setColor(STAFF_RED)
+    .setTitle('🛠️ Moderation & Utility')
+    .addFields(
+      {
+        name: '🔇 Timeouts & warnings',
+        value:
+          '**`/mute <user> <10m|2h|1d> [reason]`** — silent Discord timeout (max 28d). No logging, no embed.\n' +
+          '**`/warn <user> [reason]`** — formal warning; **DMs the user** and logs it locally.\n' +
+          '**`/warnings <user>`** — view a user\'s warning history. At the threshold the bot suggests a ban.',
+        inline: false,
+      },
+      {
+        name: '🗒️ Player notes',
+        value:
+          '**`/note <player> <text>`** — attach a **private** note to a Minecraft username (never written to the sheet).\n' +
+          '**`/notes <player>`** — list notes (newest first). Notes also appear automatically in **`/lookup-ban`** and **`/history`**.',
+        inline: false,
+      },
+      {
+        name: '🚩 Flags & leaderboard',
+        value:
+          '**`/flags`** — review unresolved alt-detection flags (paged).\n' +
+          '**`/resolve-flag <id> [note]`** — mark a flag handled.\n' +
+          '**`/leaderboard`** — staff ranked by bans logged (toggle **This Week / All Time**).',
+        inline: false,
+      },
+    )
+    .setFooter(brandFooter(`${BRAND_NAME} • Moderation tools`))
+    .setTimestamp();
+
+  const automation = new EmbedBuilder()
+    .setColor(STAFF_RED)
+    .setTitle('🤖 Automation & Safeguards')
+    .addFields(
+      {
+        name: '🔁 Prior-ban alert',
+        value: 'Running **`/log-ban`** for a player with previous bans shows you a **prior-history warning** (count + most recent offense) before you submit.',
+        inline: false,
+      },
+      {
+        name: '🎮 Minecraft verification',
+        value:
+          'On whitelist submit, the applicant\'s **IGN is checked against Mojang**. An unknown name is rejected with a resubmit prompt; ' +
+          'verified IGN + UUID are saved to the **Verified Players** sheet tab, and approval grants the verified role + sets their nickname.',
+        inline: false,
+      },
+      {
+        name: '🕵️ Alt detection',
+        value:
+          'When a whitelist ticket opens, new accounts (**< MIN_ACCOUNT_AGE_DAYS**) and applicants whose timing matches a recently ' +
+          'expired/lifted ban (**REJOIN_WINDOW_DAYS**) are **flagged** with a staff ping. Review with **`/flags`**.',
+        inline: false,
+      },
+      {
+        name: '⏰ Reminders & reports',
+        value:
+          '**Appeal reminders:** open, unclaimed ban appeals older than the threshold are re-pinged every 12h (claim one to stop it).\n' +
+          '**Weekly staff report:** every **Monday ~09:00** a digest of bans/wars/tickets per staff posts to the ban-log channel.',
+        inline: false,
+      },
+    )
+    .setFooter(brandFooter(`${BRAND_NAME} • Runs automatically`))
     .setTimestamp();
 
   const workflow = new EmbedBuilder()
@@ -703,15 +798,16 @@ function buildStaffPanel(guildIcon) {
       {
         name: '⚙️ Setup & config',
         value:
-          'Channels/roles are set in `.env`. Optional: enable inactivity auto-close with ' +
-          '`TICKET_INACTIVITY_HOURS`, and a separate evidence archive with `EVIDENCE_ARCHIVE_CHANNEL_ID`.',
+          'Channels/roles are set in `.env`. Optional tuning: inactivity auto-close (`TICKET_INACTIVITY_HOURS`), ' +
+          'evidence archive (`EVIDENCE_ARCHIVE_CHANNEL_ID`), warning threshold (`WARN_BAN_THRESHOLD`), ' +
+          'appeal reminders (`APPEAL_REMINDER_HOURS`), and alt-detection windows (`MIN_ACCOUNT_AGE_DAYS`, `REJOIN_WINDOW_DAYS`).',
         inline: false,
       },
     )
     .setFooter(brandFooter(`${BRAND_NAME} • Keep it pinned`))
     .setTimestamp();
 
-  return [header, commands, workflow];
+  return [header, commands, moderation, automation, workflow];
 }
 
 // ── /stats ────────────────────────────────────────────────────────────────────
@@ -757,6 +853,283 @@ function buildStatusEmbed({ wsPing, uptime, openTickets, online }) {
     .setTimestamp();
 }
 
+// ── Moderation / utility embeds (warnings, notes, flags, reports) ───────────────
+// Local timestamp helper → Discord relative time, tolerant of bad input.
+function relTime(iso) {
+  const t = Date.parse(iso);
+  return Number.isNaN(t) ? '`unknown`' : `<t:${Math.floor(t / 1000)}:R>`;
+}
+
+// Compact ms → "1h 2m" / "45s" (mirrors tickets.humanizeDuration without the
+// circular import).
+function humanizeMs(ms) {
+  if (ms == null) return '—';
+  const s = Math.floor(ms / 1000);
+  const d = Math.floor(s / 86_400);
+  const h = Math.floor((s % 86_400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const parts = [];
+  if (d) parts.push(`${d}d`);
+  if (h) parts.push(`${h}h`);
+  if (m) parts.push(`${m}m`);
+  if (!parts.length) parts.push(`${s}s`);
+  return parts.join(' ');
+}
+
+const FLAG_META = {
+  account_age:   { emoji: '🐣', label: 'New account' },
+  rejoin_timing: { emoji: '🕵️', label: 'Ban-rejoin timing' },
+  flag:          { emoji: '🚩', label: 'Flag' },
+};
+const flagMeta = type => FLAG_META[type] || FLAG_META.flag;
+
+// Shown to staff (ephemerally) when /log-ban is run for a player with priors.
+function buildPriorBansWarningEmbed(player, bans) {
+  const recent = bans[bans.length - 1]; // findBansByPlayer returns oldest-first
+  const id = recent ? normalizeBanId(recent.ban_id) : '';
+  return new EmbedBuilder()
+    .setColor(0xf0a500)
+    .setAuthor(brandAuthor(`⚠️ ${BRAND_NAME} · Prior History`))
+    .setTitle(`Heads up — ${player} has ${bans.length} prior ban(s)`)
+    .setDescription(
+      `This player already appears in the ban log **${bans.length}** time(s). ` +
+      'Review their history before submitting this ban.',
+    )
+    .addFields(
+      { name: '🧮 Total prior bans', value: `\`${bans.length}\``, inline: true },
+      { name: '🆔 Most recent', value: id ? `\`ID: ${id}\`` : '`—`', inline: true },
+      { name: '📅 When', value: `\`${recent?.date || '—'}\``, inline: true },
+      { name: '📋 Most recent offense', value: (recent?.offense || '—').slice(0, 256), inline: false },
+    )
+    .setFooter(brandFooter(`${BRAND_NAME} • Run /history ${player} for the full timeline`))
+    .setTimestamp();
+}
+
+// Auto-surfaced follow-up showing notes and/or unresolved flags for a player.
+function buildInsightsEmbed({ player, notes = [], flags = [] }) {
+  const embed = new EmbedBuilder()
+    .setColor(flags.length ? 0xe84343 : 0xf0a500)
+    .setAuthor(brandAuthor(`🗒️ ${BRAND_NAME} · Staff Insights`))
+    .setTitle(`Insights — ${player}`)
+    .setFooter(brandFooter(`${BRAND_NAME} • Visible to staff only`))
+    .setTimestamp();
+
+  if (flags.length) {
+    embed.setDescription(`⚠️ This player's IGN has **${flags.length}** unresolved flag(s).`);
+    embed.addFields({
+      name: '🚩 Unresolved flags',
+      value: flags.slice(0, 6).map(f => {
+        const m = flagMeta(f.type);
+        return `\`#${f.id}\` ${m.emoji} **${m.label}** — ${(f.reason || '—').slice(0, 140)} · ${relTime(f.at)}`;
+      }).join('\n').slice(0, 1024),
+      inline: false,
+    });
+  }
+
+  if (notes.length) {
+    embed.addFields({
+      name: `🗒️ Staff notes (${notes.length})`,
+      value: notes.slice(0, 5).map(n =>
+        `• ${n.text.slice(0, 180)}\n  — ${n.by ? `<@${n.by}>` : n.byTag || 'staff'} · ${relTime(n.at)}`,
+      ).join('\n').slice(0, 1024),
+      inline: false,
+    });
+  }
+
+  return embed;
+}
+
+// /notes — full notes list for a player (newest first).
+function buildNotesEmbed({ player, notes }) {
+  return new EmbedBuilder()
+    .setColor(BRAND_COLOR)
+    .setAuthor(brandAuthor(`🗒️ ${BRAND_NAME} · Staff Notes`))
+    .setTitle(`Notes — ${player}`)
+    .setDescription(
+      (notes.length
+        ? notes.slice(0, 15).map(n =>
+            `**\`#${n.id}\`** ${relTime(n.at)} — ${n.by ? `<@${n.by}>` : n.byTag || 'staff'}\n> ${n.text.slice(0, 300)}`,
+          ).join('\n\n')
+        : '_No notes on record._'
+      ).slice(0, 4096),
+    )
+    .setFooter(brandFooter(`${BRAND_NAME} • ${notes.length} note(s) · staff only`))
+    .setTimestamp();
+}
+
+// /flags — a page of unresolved flags.
+function buildFlagsListEmbed({ flags, page = 0, totalPages = 1, total = 0 }) {
+  return new EmbedBuilder()
+    .setColor(0xe84343)
+    .setAuthor(brandAuthor(`🚩 ${BRAND_NAME} · Unresolved Flags`))
+    .setTitle(`Open Flags — ${total}`)
+    .setDescription(
+      (flags.length
+        ? flags.map(f => {
+            const m = flagMeta(f.type);
+            const who = f.discordId ? `<@${f.discordId}>` : '`unknown`';
+            const ign = f.ign ? ` · IGN \`${f.ign}\`` : '';
+            return `**\`#${f.id}\`** ${m.emoji} **${m.label}** — ${who}${ign} · ${relTime(f.at)}\n> ${(f.reason || '—').slice(0, 220)}`;
+          }).join('\n\n')
+        : '_No unresolved flags._'
+      ).slice(0, 4096),
+    )
+    .setFooter(brandFooter(`${BRAND_NAME} • Page ${page + 1}/${totalPages} · resolve with /resolve-flag`))
+    .setTimestamp();
+}
+
+function buildFlagResolvedEmbed(flag) {
+  const m = flagMeta(flag.type);
+  return new EmbedBuilder()
+    .setColor(0x57c454)
+    .setAuthor(brandAuthor(`✅ ${BRAND_NAME} · Flag Resolved`))
+    .setTitle(`Flag #${flag.id} resolved`)
+    .addFields(
+      { name: '🚩 Type', value: `${m.emoji} ${m.label}`, inline: true },
+      { name: '👤 User', value: flag.discordId ? `<@${flag.discordId}>` : '`unknown`', inline: true },
+      { name: '🎮 IGN', value: flag.ign ? `\`${flag.ign}\`` : '`—`', inline: true },
+      ...(flag.resolvedNote ? [{ name: '🗒️ Note', value: flag.resolvedNote.slice(0, 512), inline: false }] : []),
+    )
+    .setFooter(brandFooter(BRAND_NAME))
+    .setTimestamp();
+}
+
+// In-channel flag posts (account age / rejoin timing).
+function buildAccountAgeFlagEmbed({ userMention, ageDays, minDays, flagId }) {
+  return new EmbedBuilder()
+    .setColor(0xf0a500)
+    .setAuthor(brandAuthor(`🐣 ${TICKET_BRAND} · Account Flag`))
+    .setTitle('New Discord account flagged')
+    .setDescription(
+      `${userMention}'s Discord account is only **${ageDays} day(s)** old (threshold **${minDays}**). ` +
+      'This is a heads-up for staff — the application can still proceed.',
+    )
+    .addFields(
+      { name: '📅 Account age', value: `\`${ageDays} day(s)\``, inline: true },
+      { name: '🚩 Flag ID', value: `\`#${flagId}\``, inline: true },
+    )
+    .setFooter(brandFooter(`${TICKET_BRAND} • Review with /flags`))
+    .setTimestamp();
+}
+
+function buildRejoinFlagEmbed({ userMention, recent, flagId }) {
+  const lines = recent.slice(0, 5).map(r =>
+    `• \`ID ${normalizeBanId(r.ban.ban_id) || '—'}\` **${r.ban.player_banned || 'Unknown'}** — ${r.how} <t:${Math.floor(r.when / 1000)}:R>`,
+  ).join('\n');
+  return new EmbedBuilder()
+    .setColor(0xe84343)
+    .setAuthor(brandAuthor(`🕵️ ${TICKET_BRAND} · Rejoin Timing Flag`))
+    .setTitle('Possible ban-evasion timing')
+    .setDescription(
+      `${userMention} opened a whitelist application shortly after the following ban(s) ended or were lifted. ` +
+      'This may be a coincidence — staff should verify before approving.',
+    )
+    .addFields(
+      { name: '🔓 Recently ended / lifted bans', value: lines.slice(0, 1024) || '`—`', inline: false },
+      { name: '🚩 Flag ID', value: `\`#${flagId}\``, inline: true },
+    )
+    .setFooter(brandFooter(`${TICKET_BRAND} • Review with /flags`))
+    .setTimestamp();
+}
+
+// /warn — DM sent to the warned user.
+function buildWarnDmEmbed({ guildName, reason, count, threshold }) {
+  const embed = new EmbedBuilder()
+    .setColor(0xf0a500)
+    .setAuthor(brandAuthor(`⚠️ ${BRAND_NAME} · Warning`))
+    .setTitle(`You have received a warning${guildName ? ` in ${guildName}` : ''}`)
+    .setDescription(reason ? `> ${reason}` : '_No reason was provided._')
+    .addFields({ name: '🧮 Total warnings', value: `\`${count}\``, inline: true })
+    .setFooter(brandFooter(BRAND_NAME))
+    .setTimestamp();
+  if (threshold && count >= threshold) {
+    embed.addFields({ name: '🚨 Notice', value: 'You have reached the warning threshold. Further infractions may result in a ban.', inline: false });
+  }
+  return embed;
+}
+
+// /warnings — a user's warning history.
+function buildWarningsEmbed({ user, warnings }) {
+  return new EmbedBuilder()
+    .setColor(warnings.length ? 0xf0a500 : NEUTRAL)
+    .setAuthor(brandAuthor(`⚠️ ${BRAND_NAME} · Warnings`))
+    .setTitle(`Warnings — ${user.tag || user.username}`)
+    .setDescription(
+      (warnings.length
+        ? warnings.slice(-15).reverse().map(w =>
+            `**\`#${w.id}\`** ${relTime(w.at)} — by ${w.by ? `<@${w.by}>` : w.byTag || 'staff'}\n> ${(w.reason || '_no reason_').slice(0, 300)}`,
+          ).join('\n\n')
+        : '_No warnings on record — clean slate._'
+      ).slice(0, 4096),
+    )
+    .setFooter(brandFooter(`${BRAND_NAME} • ${warnings.length} warning(s)`))
+    .setTimestamp();
+}
+
+// /leaderboard — ranked staff by bans logged.
+function buildLeaderboardEmbed({ entries, scope = 'all', total = 0 }) {
+  const medals = ['🥇', '🥈', '🥉'];
+  const lines = entries.slice(0, 15).map(([name, n], i) =>
+    `${medals[i] || `\`${String(i + 1).padStart(2, ' ')}.\``} **${name}** — \`${n}\``,
+  );
+  return new EmbedBuilder()
+    .setColor(BRAND_COLOR)
+    .setAuthor(brandAuthor(`🏆 ${BRAND_NAME} · Ban Leaderboard`))
+    .setTitle(scope === 'week' ? 'Top Staff — This Week' : 'Top Staff — All Time')
+    .setDescription(lines.length ? lines.join('\n') : '_No bans logged in this period._')
+    .setFooter(brandFooter(`${BRAND_NAME} • ${total} ban(s) counted`))
+    .setTimestamp();
+}
+
+// Weekly staff activity digest. `report` from src/report.js weeklyStaffReport().
+function buildWeeklyReportEmbed(report, { weekLabel } = {}) {
+  const fmt = pairs => (pairs.length
+    ? pairs.slice(0, 8).map(([name, n], i) => `\`${i + 1}.\` ${name} — **${n}**`).join('\n')
+    : '_none_');
+  const tickets = report.ticketCounts.length
+    ? report.ticketCounts.slice(0, 8).map(([name, n], i) => `\`${i + 1}.\` ${name} — **${n}**`).join('\n')
+    : '_none_';
+  return new EmbedBuilder()
+    .setColor(BRAND_COLOR)
+    .setAuthor(brandAuthor(`📈 ${BRAND_NAME} · Weekly Staff Report`))
+    .setTitle('Staff Activity Digest')
+    .setDescription(weekLabel ? `Week of **${weekLabel}**` : 'Past week')
+    .addFields(
+      { name: '🔨 Bans logged', value: fmt(report.banCounts), inline: true },
+      { name: '⚔️ Wars logged', value: fmt(report.warCounts), inline: true },
+      { name: '🎫 Tickets closed', value: tickets, inline: true },
+      { name: '⏱️ Avg first response', value: report.avgFirstResponseMs != null ? `\`${humanizeMs(report.avgFirstResponseMs)}\`` : '`—`', inline: true },
+      { name: '📦 Total tickets closed', value: `\`${report.ticketsClosed}\``, inline: true },
+    )
+    .setFooter(brandFooter(`${BRAND_NAME} • Automated weekly report`))
+    .setTimestamp();
+}
+
+// /priority — posted in the ticket when its priority changes.
+function buildPriorityEmbed({ label, byMention, color = BRAND_COLOR }) {
+  return new EmbedBuilder()
+    .setColor(color)
+    .setAuthor(brandAuthor(`🚦 ${TICKET_BRAND} · Priority Updated`))
+    .setTitle('Ticket Priority Updated')
+    .setDescription(`Priority set to **${label}** by ${byMention}.`)
+    .setFooter(brandFooter(TICKET_BRAND))
+    .setTimestamp();
+}
+
+// Posted to the ban log channel when an appeal ticket has sat unhandled.
+function buildAppealReminderEmbed({ channelMention, ageHours, ownerMention }) {
+  return new EmbedBuilder()
+    .setColor(0xf0a500)
+    .setAuthor(brandAuthor(`⏰ ${BRAND_NAME} · Appeal Reminder`))
+    .setTitle('Ban appeal awaiting review')
+    .setDescription(
+      `A ban appeal from ${ownerMention} in ${channelMention} has been open for about ` +
+      `**${ageHours}h** with no staff handling it yet. Please claim and review it.`,
+    )
+    .setFooter(brandFooter(`${BRAND_NAME} • Claim the ticket to stop these reminders`))
+    .setTimestamp();
+}
+
 module.exports = {
   buildBanEmbed,
   buildWarEmbed,
@@ -785,7 +1158,23 @@ module.exports = {
   banListLine,
   historyLine,
   myBanLine,
+  applyPriorityToOpenEmbed,
+  // ── Moderation / utility ──
+  buildPriorBansWarningEmbed,
+  buildInsightsEmbed,
+  buildNotesEmbed,
+  buildFlagsListEmbed,
+  buildFlagResolvedEmbed,
+  buildAccountAgeFlagEmbed,
+  buildRejoinFlagEmbed,
+  buildWarnDmEmbed,
+  buildWarningsEmbed,
+  buildLeaderboardEmbed,
+  buildWeeklyReportEmbed,
+  buildPriorityEmbed,
+  buildAppealReminderEmbed,
   // ── Exported for tests ──
   parseEvidence,
   banEndShort,
+  humanizeMs,
 };
