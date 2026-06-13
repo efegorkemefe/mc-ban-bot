@@ -10,7 +10,12 @@ const tickets = require('./tickets');
 const ai = require('./ai');
 const banState = require('./banState');
 const stats = require('./stats');
-const { computeBanEnd } = require('./duration');
+const warnings = require('./warnings');
+const notes = require('./notes');
+const flags = require('./flags');
+const mojang = require('./mojang');
+const report = require('./report');
+const { computeBanEnd, parseDurationMs } = require('./duration');
 const {
   buildBanEmbed,
   buildWarEmbed,
@@ -22,10 +27,8 @@ const {
   buildTicketUnclaimEmbed,
   buildTicketNoticeEmbed,
   buildWhitelistReviewEmbed,
-  buildHelpPanelEmbed,
-  buildMemberGuideEmbed,
-  buildStaffGuideEmbed,
-  buildTicketRulesEmbed,
+  buildMemberPanel,
+  buildStaffPanel,
   buildStatusEmbed,
   buildBanListEmbed,
   buildUnbanEmbed,
@@ -35,6 +38,19 @@ const {
   banListLine,
   historyLine,
   myBanLine,
+  buildPriorBansWarningEmbed,
+  buildInsightsEmbed,
+  buildNotesEmbed,
+  buildFlagsListEmbed,
+  buildFlagResolvedEmbed,
+  buildAccountAgeFlagEmbed,
+  buildRejoinFlagEmbed,
+  buildWarnDmEmbed,
+  buildWarningsEmbed,
+  buildLeaderboardEmbed,
+  buildWeeklyReportEmbed,
+  buildPriorityEmbed,
+  buildAppealReminderEmbed,
 } = require('./embeds');
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -56,6 +72,19 @@ const EVIDENCE_WINDOW_MS = 2 * 60 * 1000;
 const INACTIVITY_CLOSE_HOURS = parseFloat(process.env.TICKET_INACTIVITY_HOURS || '0');
 const INACTIVITY_WARN_HOURS = parseFloat(process.env.TICKET_INACTIVITY_WARN_HOURS || '0');
 const INACTIVITY_SWEEP_MS = 30 * 60 * 1000; // scan every 30 minutes
+
+// ── Moderation / alt-detection config ─────────────────────────────────────────
+// Warnings at/above this count trigger a "consider a ban" hint to staff.
+const WARN_BAN_THRESHOLD = parseInt(process.env.WARN_BAN_THRESHOLD || '3', 10);
+// Discord accounts younger than this (days) are flagged when opening a whitelist.
+const MIN_ACCOUNT_AGE_DAYS = parseInt(process.env.MIN_ACCOUNT_AGE_DAYS || '30', 10);
+// A whitelist applicant is flagged if a ban ended/was lifted within this window.
+const REJOIN_WINDOW_DAYS = parseInt(process.env.REJOIN_WINDOW_DAYS || '14', 10);
+// Hours an unhandled ban appeal can sit before a reminder is posted (0 disables).
+const APPEAL_REMINDER_HOURS = parseFloat(process.env.APPEAL_REMINDER_HOURS || '48');
+const APPEAL_REMINDER_SWEEP_MS = 12 * 60 * 60 * 1000; // every 12 hours
+const WEEKLY_REPORT_SWEEP_MS = 30 * 60 * 1000;        // check every 30 minutes
+const MAX_TIMEOUT_MS = 28 * 24 * 60 * 60 * 1000;      // Discord timeout ceiling (28d)
 
 // ── Client ────────────────────────────────────────────────────────────────────
 const client = new Client({
@@ -111,6 +140,38 @@ async function handlePaginatorButton(interaction) {
   });
 }
 
+// ── /leaderboard This Week ↔ All Time toggle ─────────────────────────────────
+// Caches the parsed ban list per session so the toggle re-renders without re-
+// hitting the sheet. Sessions expire after 10 minutes.
+const leaderboards = new Collection();
+
+function leaderboardComponents(token, scope) {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`lb:${token}:all`).setLabel('All Time').setEmoji('🏆').setStyle(ButtonStyle.Secondary).setDisabled(scope === 'all'),
+    new ButtonBuilder().setCustomId(`lb:${token}:week`).setLabel('This Week').setEmoji('📅').setStyle(ButtonStyle.Secondary).setDisabled(scope === 'week'),
+  )];
+}
+
+function renderLeaderboard(bans, scope) {
+  const sinceMs = scope === 'week' ? report.startOfWeek().getTime() : null;
+  const entries = report.banLeaderboard(bans, { sinceMs });
+  const total = entries.reduce((sum, [, n]) => sum + n, 0);
+  return { entries, total };
+}
+
+async function handleLeaderboardButton(interaction) {
+  const [, token, scope] = interaction.customId.split(':');
+  const session = leaderboards.get(token);
+  if (!session) {
+    return interaction.update({ content: '⏳ This leaderboard expired — run `/leaderboard` again.', embeds: [], components: [] }).catch(() => {});
+  }
+  const { entries, total } = renderLeaderboard(session.bans, scope);
+  return interaction.update({
+    embeds: [buildLeaderboardEmbed({ entries, scope, total })],
+    components: leaderboardComponents(token, scope),
+  });
+}
+
 function today() {
   return new Date().toISOString().split('T')[0]; // YYYY-MM-DD
 }
@@ -146,6 +207,27 @@ client.once(Events.ClientReady, async c => {
     }, INACTIVITY_SWEEP_MS);
   }
 
+  // Appeal-deadline reminders (opt-in via APPEAL_REMINDER_HOURS > 0).
+  if (APPEAL_REMINDER_HOURS > 0) {
+    console.log(`⏰ Appeal reminders enabled (threshold ${APPEAL_REMINDER_HOURS}h, checked every 12h).`);
+    const runAppeals = () => {
+      for (const guild of client.guilds.cache.values()) {
+        checkAppealReminders(guild).catch(err => console.error('Appeal reminder sweep failed:', err));
+      }
+    };
+    setTimeout(runAppeals, 60_000);
+    setInterval(runAppeals, APPEAL_REMINDER_SWEEP_MS);
+  }
+
+  // Weekly staff activity report (posts on/after Monday 09:00 server time).
+  const runWeekly = () => {
+    for (const guild of client.guilds.cache.values()) {
+      checkWeeklyReport(guild).catch(err => console.error('Weekly report check failed:', err));
+    }
+  };
+  setTimeout(runWeekly, 60_000);
+  setInterval(runWeekly, WEEKLY_REPORT_SWEEP_MS);
+
   await reportStartupConfig(c);
 });
 
@@ -171,10 +253,10 @@ async function reportStartupConfig(c) {
   for (const guild of c.guilds.cache.values()) {
     const me = guild.members.me;
     if (!me) continue;
-    const missing = ['ManageChannels', 'ManageRoles']
+    const missing = ['ManageChannels', 'ManageRoles', 'ModerateMembers', 'ManageNicknames']
       .filter(p => !me.permissions.has(PermissionFlagsBits[p]));
     if (missing.length) {
-      lines.push(`⚠️  Missing permission(s) in "${guild.name}": ${missing.join(', ')} — ticket/role features may not work.`);
+      lines.push(`⚠️  Missing permission(s) in "${guild.name}": ${missing.join(', ')} — some features may not work (Moderate Members → /mute, Manage Nicknames → whitelist rename).`);
     }
   }
 
@@ -188,7 +270,7 @@ client.on(Events.InteractionCreate, async interaction => {
     if (interaction.isButton()) {
       if (interaction.customId.startsWith('ticket:')) return await handleTicketButton(interaction);
       if (interaction.customId.startsWith('pg:')) return await handlePaginatorButton(interaction);
-      if (interaction.customId.startsWith('help:')) return await handleHelpButton(interaction);
+      if (interaction.customId.startsWith('lb:')) return await handleLeaderboardButton(interaction);
       return;
     }
 
@@ -205,6 +287,16 @@ client.on(Events.InteractionCreate, async interaction => {
       case 'history':       return await handleHistory(interaction);
       case 'log-war':       return await handleLogWar(interaction);
       case 'lookup-war':    return await handleLookupWar(interaction);
+      // ── Moderation / utility ──
+      case 'mute':          return await handleMute(interaction);
+      case 'warn':          return await handleWarn(interaction);
+      case 'warnings':      return await handleWarnings(interaction);
+      case 'note':          return await handleNote(interaction);
+      case 'notes':         return await handleNotes(interaction);
+      case 'flags':         return await handleFlags(interaction);
+      case 'resolve-flag':  return await handleResolveFlag(interaction);
+      case 'leaderboard':   return await handleLeaderboard(interaction);
+      case 'priority':      return await handlePriority(interaction);
       // ── Ticket commands ──
       case 'ticket-panel':  return await handleTicketPanel(interaction);
       case 'add':           return await handleTicketAdd(interaction);
@@ -215,7 +307,8 @@ client.on(Events.InteractionCreate, async interaction => {
       case 'close':         return await handleTicketClose(interaction);
       case 'wl-accept':     return await handleWlAccept(interaction);
       case 'help':          return await handleHelp(interaction);
-      case 'help-panel':    return await handleHelpPanel(interaction);
+      case 'info-panel':    return await handleInfoPanel(interaction);
+      case 'staff-panel':   return await handleStaffPanel(interaction);
       case 'ping':          return await handlePing(interaction);
     }
   } catch (err) {
@@ -297,7 +390,13 @@ async function handleTicketButton(interaction) {
     const res = await tickets.createTicket(interaction.guild, interaction.member, typeKey);
     if (!res.ok) return interaction.editReply(res.message);
     const label = tickets.TICKET_TYPES[typeKey]?.label || 'ticket';
-    return interaction.editReply(`✅ Your **${label}** ticket has been created: <#${res.channel.id}>`);
+    await interaction.editReply(`✅ Your **${label}** ticket has been created: <#${res.channel.id}>`);
+    // Whitelist tickets get alt-detection flags posted in-channel (non-blocking).
+    if (typeKey === 'whitelist') {
+      runWhitelistOpenChecks(res.channel, interaction.user)
+        .catch(err => console.error('Whitelist open checks failed:', err));
+    }
+    return;
   }
 
   // Everything else acts on the current ticket channel.
@@ -354,6 +453,71 @@ async function handleTicketButton(interaction) {
   }
 }
 
+// ── Whitelist open checks (account age + ban-rejoin timing) ─────────────────────
+// Runs after a whitelist ticket is created. Records the applicant for join-timing
+// detection and posts staff-pinged flags into the ticket when something looks off.
+// Flags are advisory — they never block the application.
+async function runWhitelistOpenChecks(channel, user) {
+  const staffRoleIds = tickets.staffPingRoleIds();
+  const pingContent = staffRoleIds.map(r => `<@&${r}>`).join(' ') || undefined;
+
+  flags.recordApplicant({
+    discordId: user.id,
+    accountCreatedAt: new Date(user.createdTimestamp).toISOString(),
+    ticketOpenedAt: new Date().toISOString(),
+  });
+
+  // 1) New Discord account.
+  const ageDays = Math.floor((Date.now() - user.createdTimestamp) / 86_400_000);
+  if (ageDays < MIN_ACCOUNT_AGE_DAYS) {
+    const flag = flags.addFlag({
+      discordId: user.id,
+      type: 'account_age',
+      reason: `Discord account only ${ageDays} day(s) old (threshold ${MIN_ACCOUNT_AGE_DAYS}).`,
+    });
+    await channel.send({
+      content: pingContent,
+      embeds: [buildAccountAgeFlagEmbed({ userMention: `<@${user.id}>`, ageDays, minDays: MIN_ACCOUNT_AGE_DAYS, flagId: flag.id })],
+      allowedMentions: { roles: staffRoleIds },
+    }).catch(() => {});
+  }
+
+  // 2) Ban-rejoin timing: any ban that ended or was lifted within the window.
+  try {
+    const rows = await withTimeout(sheets.getBanRecords());
+    const now = Date.now();
+    const windowMs = REJOIN_WINDOW_DAYS * 86_400_000;
+    const recent = [];
+    for (const b of rows.map(sheets.rowToBan)) {
+      if (!sheets.normalizeBanId(b.ban_id)) continue;
+      const unban = banState.getUnban(b.ban_id);
+      if (unban?.at) {
+        const t = Date.parse(unban.at);
+        if (!Number.isNaN(t) && t <= now && now - t <= windowMs) { recent.push({ ban: b, when: t, how: 'lifted' }); continue; }
+      }
+      const info = computeBanEnd(b.date, b.duration);
+      if (info.state === 'ended' && info.endMs && info.endMs <= now && now - info.endMs <= windowMs) {
+        recent.push({ ban: b, when: info.endMs, how: 'expired' });
+      }
+    }
+    if (recent.length) {
+      recent.sort((a, b) => b.when - a.when);
+      const flag = flags.addFlag({
+        discordId: user.id,
+        type: 'rejoin_timing',
+        reason: `Applied within ${REJOIN_WINDOW_DAYS}d of ${recent.length} ban(s) ending/being lifted (e.g. ${recent[0].ban.player_banned || 'unknown'}).`,
+      });
+      await channel.send({
+        content: pingContent,
+        embeds: [buildRejoinFlagEmbed({ userMention: `<@${user.id}>`, recent, flagId: flag.id })],
+        allowedMentions: { roles: staffRoleIds },
+      }).catch(() => {});
+    }
+  } catch (err) {
+    console.warn('Rejoin-timing check skipped:', err.message);
+  }
+}
+
 // ── Whitelist: Submit for Review (AI decision) ──────────────────────────────────
 async function handleWhitelistSubmit(interaction, meta) {
   if (meta.type !== 'whitelist') {
@@ -372,6 +536,29 @@ async function handleWhitelistSubmit(interaction, meta) {
       '⚠️ Please type your application in this channel first — your Minecraft username, age, whether you own an ' +
       'original copy of Minecraft, and why you want to join — then click **Submit for Review** again.',
     );
+  }
+
+  // ── Verify the Minecraft IGN against Mojang ──
+  // A confirmed 404 (no such username) blocks submission; API/network errors do
+  // not (we proceed unverified rather than punish the applicant for a Mojang outage).
+  let verified = null;
+  const candidateIgn = mojang.extractIgn(appText);
+  if (candidateIgn) {
+    const v = await mojang.verifyIgn(candidateIgn).catch(() => ({ ok: false, status: 0 }));
+    if (!v.ok && v.status === 404) {
+      return interaction.editReply(
+        `⚠️ I couldn't find a Minecraft account named **${candidateIgn}**. ` +
+        'Please double-check the spelling, type your correct **in-game name** in this channel, ' +
+        'and click **📨 Submit for Review** again.',
+      );
+    }
+    if (v.ok) {
+      verified = { ign: v.name, uuid: v.uuid };
+      sheets.recordVerifiedPlayer({ discordId: meta.ownerId, discordTag: interaction.user.tag, ign: v.name, uuid: v.uuid })
+        .catch(err => console.warn('Verified-players sheet write failed:', err.message));
+      flags.backfillIgn(meta.ownerId, v.name);
+      flags.updateApplicantIgn(meta.ownerId, v.name, v.uuid);
+    }
   }
 
   const aiEnabled = ai.isEnabled();
@@ -411,7 +598,7 @@ async function handleWhitelistSubmit(interaction, meta) {
   });
 
   if (approved) {
-    const roleRes = await tickets.giveMemberRole(interaction.guild, meta.ownerId);
+    const roleRes = await tickets.grantWhitelist(interaction.guild, meta.ownerId, { ign: verified?.ign });
     await interaction.message.edit({ components: tickets.closedControlComponents() }).catch(() => {});
 
     if (!roleRes.ok) {
@@ -433,7 +620,11 @@ async function handleWhitelistSubmit(interaction, meta) {
     setTimeout(() => {
       tickets.closeTicket(interaction.channel, { id: client.user.id }, 'Whitelist approved automatically', client).catch(() => {});
     }, 10_000);
-    return interaction.editReply('✅ Your application was approved and you now have the member role! This ticket will close shortly.');
+    return interaction.editReply(
+      '✅ Your application was approved and you now have the member role!' +
+      (roleRes.nickname ? ` Your nickname has been set to **${roleRes.nickname}**.` : '') +
+      ' This ticket will close shortly.',
+    );
   }
 
   // Rejected → offer an appeal.
@@ -530,14 +721,17 @@ async function handleWlAccept(interaction) {
   const user = interaction.options.getUser('user');
   await interaction.deferReply();
 
-  const res = await withTimeout(tickets.giveMemberRole(interaction.guild, user.id));
+  // If we verified this user's IGN earlier, set their nickname to it on approval.
+  const storedIgn = flags.getApplicantIgn(user.id);
+  const res = await withTimeout(tickets.grantWhitelist(interaction.guild, user.id, { ign: storedIgn }));
   if (!res.ok) {
     return interaction.editReply(`❌ Could not assign the member role to <@${user.id}>: \`${res.error}\`\n(Make sure my role is **above** the member role and I have **Manage Roles**.)`);
   }
   return interaction.editReply({
     embeds: [buildTicketNoticeEmbed({
       title: 'Whitelist Accepted',
-      description: `<@${user.id}> has been given the member role by <@${interaction.user.id}>. Welcome aboard! 🎉`,
+      description: `<@${user.id}> has been given the member role by <@${interaction.user.id}>.` +
+        (res.nickname ? ` Nickname set to **${res.nickname}**.` : '') + ' Welcome aboard! 🎉',
       color: 0x57c454,
       emoji: '✅',
     })],
@@ -677,6 +871,20 @@ async function handleLogBan(interaction) {
     staff_id:      interaction.user.id,
   };
 
+  await interaction.deferReply({ ephemeral: true });
+
+  // Cross-reference: warn staff if this player already has bans on record, so
+  // they're informed before submitting. Best-effort — never blocks the ban.
+  let priorEmbed = null;
+  try {
+    const prior = await withTimeout(sheets.findBansByPlayer(banData.player_banned));
+    if (prior.length) {
+      priorEmbed = buildPriorBansWarningEmbed(banData.player_banned, prior.map(m => sheets.rowToBan(m.rowData)));
+    }
+  } catch (err) {
+    console.warn('Prior-ban cross-reference skipped:', err.message);
+  }
+
   // Replace any existing pending entry for this user.
   const existing = pendingEvidence.get(interaction.user.id);
   if (existing?.timeout) clearTimeout(existing.timeout);
@@ -697,13 +905,13 @@ async function handleLogBan(interaction) {
     timeout,
   });
 
-  await interaction.reply({
+  await interaction.editReply({
     content:
       `✅ Ban details recorded for **${banData.player_banned}** (ID will be assigned automatically).\n\n` +
       `📎 **Upload your evidence screenshot(s) in this channel within 2 minutes.**\n` +
       `Each upload is auto-removed to keep the channel clean. Type \`done\` when finished ` +
       `(or just wait — I'll log it automatically once the window closes).`,
-    ephemeral: true,
+    embeds: priorEmbed ? [priorEmbed] : [],
   });
 }
 
@@ -889,6 +1097,23 @@ async function handleUpdateAppeal(interaction) {
   await interaction.editReply({ embeds: [embed] });
 }
 
+// Sends an ephemeral follow-up with staff notes and/or unresolved flags for a
+// player, if any exist. Used by /lookup-ban, /history and /notes.
+async function surfacePlayerInsights(interaction, player, { includeNotes = true } = {}) {
+  if (!player) return;
+  try {
+    const playerNotes = includeNotes ? notes.getNotes(player) : [];
+    const playerFlags = flags.getUnresolvedFlagsByIgn(player);
+    if (!playerNotes.length && !playerFlags.length) return;
+    await interaction.followUp({
+      embeds: [buildInsightsEmbed({ player, notes: playerNotes, flags: playerFlags })],
+      ephemeral: true,
+    }).catch(() => {});
+  } catch (err) {
+    console.warn('surfacePlayerInsights failed:', err.message);
+  }
+}
+
 // ── /lookup-ban ────────────────────────────────────────────────────────────────
 async function handleLookupBan(interaction) {
   const query = interaction.options.getString('query');
@@ -898,12 +1123,14 @@ async function handleLookupBan(interaction) {
   if (byId) {
     const ban = sheets.rowToBan(byId.rowData);
     await interaction.editReply({ embeds: [buildBanLookupEmbed(ban, { unban: banState.getUnban(ban.ban_id) })] });
+    await surfacePlayerInsights(interaction, ban.player_banned);
     return;
   }
 
   const matches = await withTimeout(sheets.findBansByPlayer(query));
   if (matches.length === 0) {
     await interaction.editReply(`❌ No bans found for \`${query}\`.`);
+    await surfacePlayerInsights(interaction, query);
     return;
   }
 
@@ -913,6 +1140,7 @@ async function handleLookupBan(interaction) {
     return buildBanLookupEmbed(ban, { unban: banState.getUnban(ban.ban_id) });
   });
   await replyPaginated(interaction, embeds, `Found **${matches.length}** ban(s) for \`${query}\`:`);
+  await surfacePlayerInsights(interaction, query);
 }
 
 // ── /findban (public: a player looks up their own Ban ID to give to staff) ───────
@@ -1046,7 +1274,8 @@ async function handleHistory(interaction) {
     }));
   }
 
-  return replyPaginated(interaction, embeds);
+  await replyPaginated(interaction, embeds);
+  await surfacePlayerInsights(interaction, player);
 }
 
 // ── /log-war ────────────────────────────────────────────────────────────────
@@ -1096,39 +1325,266 @@ async function handleLookupWar(interaction) {
   await replyPaginated(interaction, embeds, `Found **${matches.length}** record(s) for \`${team}\`:`);
 }
 
-// ── Help Center (/help, /help-panel) ────────────────────────────────────────────
-// The three guide buttons shown on the help panel.
-function helpPanelComponents() {
-  return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('help:member').setLabel('Member Guide').setEmoji('📖').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('help:staff').setLabel('Staff Guide').setEmoji('🛠️').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('help:rules').setLabel('Ticket Rules').setEmoji('🎫').setStyle(ButtonStyle.Secondary),
-  )];
+// ── /mute (temporary Discord timeout) ──────────────────────────────────────────
+async function handleMute(interaction) {
+  if (!requireStaff(interaction)) return;
+  if (botLacks(interaction, 'ModerateMembers')) {
+    return interaction.reply({ content: '❌ I\'m missing the **Moderate Members** permission needed to time members out.', ephemeral: true });
+  }
+
+  const target = interaction.options.getMember('user');
+  const durationStr = interaction.options.getString('duration');
+  const reason = interaction.options.getString('reason') || 'No reason provided';
+
+  if (!target || typeof target.timeout !== 'function') {
+    return interaction.reply({ content: '❌ That user isn\'t in this server.', ephemeral: true });
+  }
+  const ms = parseDurationMs(durationStr);
+  if (!ms || ms <= 0) {
+    return interaction.reply({ content: '❌ I couldn\'t understand that duration. Try `10m`, `2h`, or `1d`.', ephemeral: true });
+  }
+  if (ms > MAX_TIMEOUT_MS) {
+    return interaction.reply({ content: '❌ Discord timeouts can be at most **28 days**.', ephemeral: true });
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+  try {
+    await target.timeout(ms, `${reason} — by ${interaction.user.tag}`);
+    return interaction.editReply(`🔇 Timed out **${target.user.tag}** for \`${durationStr}\`.`);
+  } catch (err) {
+    return interaction.editReply(
+      `❌ Could not time out <@${target.id}>: \`${err.message}\`\n` +
+      '(My role must be **above** theirs, and server owners/admins cannot be timed out.)',
+    );
+  }
 }
 
-// /help — show the help center to the person who ran it (ephemeral).
+// ── /warn + /warnings ────────────────────────────────────────────────────────────
+async function handleWarn(interaction) {
+  if (!requireStaff(interaction)) return;
+  const user = interaction.options.getUser('user');
+  const reason = interaction.options.getString('reason') || '';
+  await interaction.deferReply({ ephemeral: true });
+
+  const { count } = warnings.addWarning(user.id, { by: interaction.user.id, byTag: interaction.user.tag, reason });
+
+  let dmOk = true;
+  try {
+    await user.send({ embeds: [buildWarnDmEmbed({ guildName: interaction.guild?.name, reason, count, threshold: WARN_BAN_THRESHOLD })] });
+  } catch {
+    dmOk = false; // user has DMs closed or shares no DM-able context
+  }
+
+  let msg = `⚠️ Warned **${user.tag}** — warning **#${count}**.` + (dmOk ? '' : ' _(Could not DM them.)_');
+  if (count >= WARN_BAN_THRESHOLD) {
+    msg += `\n🚨 They now have **${count}** warnings (threshold **${WARN_BAN_THRESHOLD}**) — consider a ban.`;
+  }
+  return interaction.editReply(msg);
+}
+
+async function handleWarnings(interaction) {
+  if (!requireStaff(interaction)) return;
+  const user = interaction.options.getUser('user');
+  await interaction.deferReply({ ephemeral: true });
+  return interaction.editReply({ embeds: [buildWarningsEmbed({ user, warnings: warnings.getWarnings(user.id) })] });
+}
+
+// ── /note + /notes ────────────────────────────────────────────────────────────────
+async function handleNote(interaction) {
+  if (!requireStaff(interaction)) return;
+  const player = interaction.options.getString('player');
+  const text = interaction.options.getString('text');
+  await interaction.deferReply({ ephemeral: true });
+  const entry = notes.addNote(player, { by: interaction.user.id, byTag: interaction.user.tag, text });
+  return interaction.editReply(`🗒️ Note \`#${entry.id}\` saved for \`${player}\`. View them with \`/notes player:${player}\`.`);
+}
+
+async function handleNotes(interaction) {
+  if (!requireStaff(interaction)) return;
+  const player = interaction.options.getString('player');
+  await interaction.deferReply({ ephemeral: true });
+  const list = notes.getNotes(player);
+  if (!list.length) {
+    await interaction.editReply(`🗒️ No notes on record for \`${player}\`.`);
+  } else {
+    await interaction.editReply({ embeds: [buildNotesEmbed({ player, notes: list })] });
+  }
+  // Surface unresolved flags too (notes are already shown above).
+  await surfacePlayerInsights(interaction, player, { includeNotes: false });
+}
+
+// ── /flags + /resolve-flag ─────────────────────────────────────────────────────────
+async function handleFlags(interaction) {
+  if (!requireStaff(interaction)) return;
+  await interaction.deferReply({ ephemeral: true });
+  const list = flags.getUnresolvedFlags().slice().reverse(); // newest first
+  if (!list.length) return interaction.editReply('✅ No unresolved flags right now.');
+
+  const PER_PAGE = 6;
+  const totalPages = Math.ceil(list.length / PER_PAGE);
+  const embeds = [];
+  for (let i = 0; i < list.length; i += PER_PAGE) {
+    embeds.push(buildFlagsListEmbed({ flags: list.slice(i, i + PER_PAGE), page: embeds.length, totalPages, total: list.length }));
+  }
+  return replyPaginated(interaction, embeds);
+}
+
+async function handleResolveFlag(interaction) {
+  if (!requireStaff(interaction)) return;
+  const id = interaction.options.getInteger('flag_id');
+  const note = interaction.options.getString('note') || '';
+  await interaction.deferReply({ ephemeral: true });
+  const res = flags.resolveFlag(id, { by: interaction.user.id, note });
+  if (!res) return interaction.editReply(`❌ No flag with ID \`#${id}\`.`);
+  if (res.already) return interaction.editReply(`ℹ️ Flag \`#${id}\` is already resolved.`);
+  return interaction.editReply({ embeds: [buildFlagResolvedEmbed(res.flag)] });
+}
+
+// ── /leaderboard ────────────────────────────────────────────────────────────────
+async function handleLeaderboard(interaction) {
+  if (!requireStaff(interaction)) return;
+  await interaction.deferReply({ ephemeral: true });
+
+  const rows = await withTimeout(sheets.getBanRecords());
+  const bans = rows.map(sheets.rowToBan).filter(b => sheets.normalizeBanId(b.ban_id));
+
+  const token = Math.random().toString(36).slice(2, 10);
+  setTimeout(() => leaderboards.delete(token), PAGINATOR_TTL_MS);
+  leaderboards.set(token, { bans });
+
+  const { entries, total } = renderLeaderboard(bans, 'all');
+  return interaction.editReply({
+    embeds: [buildLeaderboardEmbed({ entries, scope: 'all', total })],
+    components: leaderboardComponents(token, 'all'),
+  });
+}
+
+// ── /priority (set a ticket's priority level) ───────────────────────────────────
+async function handlePriority(interaction) {
+  const meta = await requireTicket(interaction);
+  if (!meta) return;
+  if (!requireStaff(interaction)) return;
+
+  const level = interaction.options.getString('level');
+  await interaction.deferReply();
+
+  tickets.setPriority(interaction.guild.id, interaction.channel.id, level);
+
+  // Rename the channel (fire-and-forget — channel renames are rate-limited).
+  if (!botLacks(interaction, 'ManageChannels')) {
+    const newName = tickets.priorityChannelName(interaction.channel.name, level);
+    if (newName !== interaction.channel.name) interaction.channel.setName(newName).catch(() => {});
+  }
+
+  // Reflect the new priority in the ticket's opening embed.
+  await tickets.updateOpenEmbedPriority(interaction.channel, client.user.id, level).catch(() => {});
+
+  // Urgent → ping senior staff unless a senior already has it claimed.
+  if (level === 'urgent' && SENIOR_ROLE_IDS.length) {
+    const claimerId = tickets.getClaimedBy(interaction.channel);
+    let claimerIsSenior = false;
+    if (claimerId) {
+      const cm = await interaction.guild.members.fetch(claimerId).catch(() => null);
+      claimerIsSenior = cm ? tickets.isSenior(cm) : false;
+    }
+    if (!claimerIsSenior) {
+      await interaction.channel.send({
+        content: SENIOR_ROLE_IDS.map(r => `<@&${r}>`).join(' '),
+        embeds: [buildTicketNoticeEmbed({
+          title: 'Urgent Ticket',
+          description: `This ticket was marked **🔴 Urgent** by <@${interaction.user.id}> and needs prompt attention.`,
+          color: 0xe84343,
+          emoji: '🔴',
+        })],
+        allowedMentions: { roles: SENIOR_ROLE_IDS },
+      }).catch(() => {});
+    }
+  }
+
+  return interaction.editReply({
+    embeds: [buildPriorityEmbed({
+      label: tickets.priorityLabel(level),
+      byMention: `<@${interaction.user.id}>`,
+      color: (tickets.PRIORITIES[level] || tickets.PRIORITIES.normal).color,
+    })],
+  });
+}
+
+// ── Help panels (/help, /info-panel, /staff-panel) ──────────────────────────────
+function guildIconUrl(interaction) {
+  return interaction.guild?.iconURL ? interaction.guild.iconURL({ size: 256 }) : null;
+}
+
+// Rough character count of an embed (used to respect Discord's 6000-char /
+// message limit when a panel has many embeds).
+function embedChars(embed) {
+  const j = embed.toJSON();
+  let n = (j.title || '').length + (j.description || '').length +
+    ((j.footer && j.footer.text) || '').length + ((j.author && j.author.name) || '').length;
+  for (const f of j.fields || []) n += f.name.length + f.value.length;
+  return n;
+}
+
+// Splits embeds into message-sized groups (≤10 embeds and ≤~5800 chars each) so a
+// multi-embed panel never trips Discord's per-message limits.
+function chunkEmbeds(embeds, { maxChars = 5800, maxEmbeds = 10 } = {}) {
+  const groups = [];
+  let cur = [];
+  let curChars = 0;
+  for (const embed of embeds) {
+    const c = embedChars(embed);
+    if (cur.length && (curChars + c > maxChars || cur.length >= maxEmbeds)) {
+      groups.push(cur);
+      cur = [];
+      curChars = 0;
+    }
+    cur.push(embed);
+    curChars += c;
+  }
+  if (cur.length) groups.push(cur);
+  return groups;
+}
+
+// Posts a multi-embed panel to a channel across as many messages as needed.
+async function sendPanel(channel, embeds) {
+  for (const group of chunkEmbeds(embeds)) {
+    await channel.send({ embeds: group });
+  }
+}
+
+// Replies to an interaction with a multi-embed panel (ephemeral), spilling extra
+// embeds into follow-ups when they don't fit one message.
+async function replyPanel(interaction, embeds) {
+  const groups = chunkEmbeds(embeds);
+  await interaction.reply({ embeds: groups[0], ephemeral: true });
+  for (let i = 1; i < groups.length; i++) {
+    await interaction.followUp({ embeds: groups[i], ephemeral: true });
+  }
+}
+
+// /help — show the player help board privately to whoever runs it.
 async function handleHelp(interaction) {
-  return interaction.reply({ embeds: [buildHelpPanelEmbed()], components: helpPanelComponents(), ephemeral: true });
+  return replyPanel(interaction, buildMemberPanel(guildIconUrl(interaction)));
 }
 
-// /help-panel — admins post the help center publicly in the current channel.
-async function handleHelpPanel(interaction) {
+// /info-panel — admins post the player board publicly (e.g. in #info).
+async function handleInfoPanel(interaction) {
   if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
-    return interaction.reply({ content: '❌ You need the **Manage Server** permission to post the help panel.', ephemeral: true });
+    return interaction.reply({ content: '❌ You need the **Manage Server** permission to post the info panel.', ephemeral: true });
   }
   await interaction.deferReply({ ephemeral: true });
-  await interaction.channel.send({ embeds: [buildHelpPanelEmbed()], components: helpPanelComponents() });
-  return interaction.editReply('✅ Help panel posted.');
+  await sendPanel(interaction.channel, buildMemberPanel(guildIconUrl(interaction)));
+  return interaction.editReply('✅ Player info panel posted.');
 }
 
-// Guide buttons → reply privately with the chosen tutorial (works on both the
-// public panel and the ephemeral /help message).
-async function handleHelpButton(interaction) {
-  const which = interaction.customId.split(':')[1];
-  const embed = which === 'staff' ? buildStaffGuideEmbed()
-    : which === 'rules' ? buildTicketRulesEmbed()
-      : buildMemberGuideEmbed();
-  return interaction.reply({ embeds: [embed], ephemeral: true });
+// /staff-panel — admins post the staff handbook (e.g. in the staff channel).
+async function handleStaffPanel(interaction) {
+  if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+    return interaction.reply({ content: '❌ You need the **Manage Server** permission to post the staff panel.', ephemeral: true });
+  }
+  await interaction.deferReply({ ephemeral: true });
+  await sendPanel(interaction.channel, buildStaffPanel(guildIconUrl(interaction)));
+  return interaction.editReply('✅ Staff handbook posted.');
 }
 
 // ── /ping ─────────────────────────────────────────────────────────────────────
@@ -1153,6 +1609,78 @@ async function handlePing(interaction) {
     embeds: [buildStatusEmbed({ wsPing, uptime, openTickets, online: true })],
     ephemeral: true,
   });
+}
+
+// ── Appeal-deadline reminders ───────────────────────────────────────────────────
+// Posts a reminder to the ban-log channel for any OPEN, UNCLAIMED ban appeal that
+// has sat longer than APPEAL_REMINDER_HOURS. Claiming the ticket stops reminders;
+// reminders are throttled to at most once per threshold window per ticket.
+async function checkAppealReminders(guild) {
+  if (!(APPEAL_REMINDER_HOURS > 0)) return;
+  const channel = await client.channels.fetch(BAN_LOG_CHANNEL_ID).catch(() => null);
+  if (!channel) return;
+
+  const now = Date.now();
+  const thresholdMs = APPEAL_REMINDER_HOURS * 3_600_000;
+  const roleIds = tickets.staffPingRoleIds();
+
+  for (const ch of guild.channels.cache.values()) {
+    const meta = tickets.decodeTopic(ch.topic);
+    if (!meta || meta.type !== 'ban_appeal' || meta.status === 'closed') continue;
+    if (tickets.getClaimedBy(ch)) continue;             // already being handled
+    const ageMs = now - ch.createdTimestamp;
+    if (ageMs < thresholdMs) continue;
+    const last = tickets.getAppealReminderAt(guild.id, ch.id);
+    if (last && now - last < thresholdMs) continue;     // throttle
+
+    tickets.setAppealReminderAt(guild.id, ch.id, now);
+    await channel.send({
+      content: roleIds.map(r => `<@&${r}>`).join(' ') || undefined,
+      embeds: [buildAppealReminderEmbed({
+        channelMention: `<#${ch.id}>`,
+        ageHours: Math.round(ageMs / 3_600_000),
+        ownerMention: meta.ownerId ? `<@${meta.ownerId}>` : 'someone',
+      })],
+      allowedMentions: { roles: roleIds },
+    }).catch(() => {});
+  }
+}
+
+// ── Weekly staff activity report ────────────────────────────────────────────────
+// On/after Monday 09:00 (server local time), posts a digest of the week that just
+// ended to the ban-log channel. Deduplicated per ISO-week via the local store.
+async function checkWeeklyReport(guild) {
+  const now = new Date();
+  const weekStart = report.startOfWeek(now);          // this week's Monday 00:00
+  const trigger = new Date(weekStart);
+  trigger.setHours(9, 0, 0, 0);                       // Monday 09:00 local
+  if (now < trigger) return;
+
+  const mondayIso = weekStart.toISOString().slice(0, 10);
+  if (tickets.getLastWeeklyReport(guild.id) === mondayIso) return; // already posted this week
+
+  const channel = await client.channels.fetch(BAN_LOG_CHANNEL_ID).catch(() => null);
+  if (!channel) return;
+
+  const [banRows, warRows] = await Promise.all([
+    withTimeout(sheets.getBanRecords()).catch(() => []),
+    withTimeout(sheets.getWarRows()).catch(() => []),
+  ]);
+
+  // Cover the week that just ended: [previous Monday, this Monday).
+  const prevMonday = new Date(weekStart);
+  prevMonday.setDate(prevMonday.getDate() - 7);
+  const data = report.weeklyStaffReport({
+    bans: banRows.map(sheets.rowToBan),
+    wars: warRows.map(sheets.rowToWar),
+    closedTickets: tickets.getClosedTickets(guild.id),
+    weekStartMs: prevMonday.getTime(),
+    weekEndMs: weekStart.getTime(),
+  });
+
+  const weekLabel = `${prevMonday.toISOString().slice(0, 10)} – ${weekStart.toISOString().slice(0, 10)}`;
+  await channel.send({ embeds: [buildWeeklyReportEmbed(data, { weekLabel })] }).catch(() => {});
+  tickets.setLastWeeklyReport(guild.id, mondayIso);
 }
 
 // ── Process-level safety net ────────────────────────────────────────────────────

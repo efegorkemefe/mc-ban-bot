@@ -1,19 +1,25 @@
 # 🔨 SovietCraft Community Bot (`mc-ban-bot`)
 
-An all-in-one Discord bot for a Minecraft community. Three systems in one:
+An all-in-one Discord bot for a Minecraft community:
 
 1. **Moderation logging** — staff log player **bans** and **war/raid approvals**;
    each entry is written to a styled **Google Sheet** and posted as a clean embed.
 2. **Ticket system** — a button **control panel** opens private, category-based
-   support/report/application channels with staff **claiming**, `/add`/`/remove`,
-   and saved **transcripts** on close.
-3. **Whitelist applications** — applicants apply in a ticket; **AI** (Claude) can
-   auto-approve and grant the member role, or — with no API key — applications go
-   to staff for manual approval via `/wl-accept`.
+   support/report/application channels with staff **claiming**, **priority** levels,
+   `/add`/`/remove`, and saved **transcripts** on close.
+3. **Whitelist applications** — applicants apply in a ticket; their **IGN is verified
+   against Mojang**; **AI** (Claude) can auto-approve and grant the member role, or —
+   with no API key — applications go to staff for manual approval via `/wl-accept`.
+4. **Moderation toolkit** — `/mute` timeouts, `/warn` warnings (with DMs), private
+   `/note`s on players, an alt-detection **flag** system, a staff **leaderboard**, and
+   an automatic **weekly staff report**.
 
 Everything is **rebrandable** via `.env` (name, colour, icon), so it isn't tied to
 one server. This README gets a new developer up to speed quickly — no deep Discord
 or Google knowledge assumed.
+
+> 📘 **Day-to-day usage** (every command, workflow, and automated feature) lives in
+> **[`USAGE.md`](USAGE.md)**.
 
 ---
 
@@ -48,27 +54,46 @@ Two Google Sheet tabs are used inside one spreadsheet:
 | `/stats` | Moderation dashboard: bans by severity, top staff, war/raid counts, open tickets. |
 | `/log-war` | Log a war or raid approval. Posts immediately — no evidence step. |
 | `/lookup-war` | Find war/raid records for a team or player (paged). |
+| `/leaderboard` | Ranked staff by bans logged, with a **This Week / All Time** toggle. |
+
+When you run `/log-ban` for a player who already has bans, an ephemeral **prior-history**
+warning embed (count + most recent offense) is shown before you submit. Notes and
+unresolved flags for a player are surfaced automatically under `/lookup-ban` and `/history`.
+
+### Moderation & utility commands
+
+| Command | Who | What it does |
+|---------|-----|--------------|
+| `/mute` | Staff | Temporarily **time out** a member (`10m` / `2h` / `1d`, max 28d). No logging — just a silent Discord timeout. |
+| `/warn` | Staff | Issue a formal warning (stored in `data/warnings.json`, **DMs the user**). At `WARN_BAN_THRESHOLD` warnings it suggests a ban. |
+| `/warnings` | Staff | View a user's warning history. |
+| `/note` | Staff | Attach a private staff note to a **player username** (`data/notes.json`, never written to the sheet). |
+| `/notes` | Staff | List a player's notes (newest first) + surface any unresolved flags. |
+| `/flags` | Staff | View unresolved alt-detection flags (paged). |
+| `/resolve-flag` | Staff | Mark a flag resolved by its ID, with an optional note. |
 
 ### Ticket commands
 
 | Command | Who | What it does |
 |---------|-----|--------------|
-| `/ticket-panel` | Admin (Manage Server) | Posts the ticket control panel in the current channel and auto-creates the six ticket categories. |
+| `/ticket-panel` | Admin (Manage Server) | Posts the ticket control panel in the current channel and auto-creates the seven ticket categories. |
 | `/add` | Staff | Add a user to the current ticket. |
 | `/remove` | Staff | Remove a user from the current ticket (cannot remove the owner). |
 | `/claim` | Staff | Claim the ticket — only you and senior staff can respond afterward. |
 | `/unclaim` | Claimer / Senior | Release a claimed ticket so all staff can respond again. |
 | `/rename` | Staff | Rename the ticket channel. |
+| `/priority` | Staff | Set the ticket's priority (**Low / Normal / Urgent**). Renames the channel (`low-` / `URG-`) and pings senior staff for Urgent. |
 | `/close` | Staff / Owner | Archive (save transcript) and delete the ticket. |
-| `/wl-accept` | Staff | Manually approve a whitelist applicant and grant them the member role. |
+| `/wl-accept` | Staff | Manually approve a whitelist applicant and grant them the member role (sets nickname to a verified IGN if known). |
 
-### Utility commands
+### Public & help commands
 
 | Command | Who | What it does |
 |---------|-----|--------------|
 | `/findban` | Everyone | A banned player looks up **their own Ban ID** by username (to give staff when appealing). |
-| `/help` | Everyone | Opens the **help center** — buttons for the Member Guide, Staff Guide, and Ticket Rules (private to you). |
-| `/help-panel` | Admin (Manage Server) | Posts the help center **publicly** in the current channel so everyone can use the guide buttons. |
+| `/help` | Everyone | Shows the **player help & info** board privately to you. |
+| `/info-panel` | Admin (Manage Server) | Posts the **player Help & Info** board in the current channel (pin it in `#info`). |
+| `/staff-panel` | Admin (Manage Server) | Posts the **staff handbook** board in the current channel (pin it in your staff channel). |
 | `/ping` | Everyone | Bot status — latency, uptime, and open-ticket count. |
 
 ### The `/log-ban` evidence flow
@@ -128,17 +153,22 @@ update those constants to match.
 ```
 mc-ban-bot/
 ├── src/
-│   ├── index.js            # Bot entry point: routes slash commands + ticket buttons, evidence flow
+│   ├── index.js            # Bot entry point: routes slash commands + ticket buttons, evidence flow, schedulers
 │   ├── deploy-commands.js  # Registers the slash commands with Discord (run once)
-│   ├── sheets.js           # All Google Sheets reads/writes + cell styling + auto-ID + retry/backoff
-│   ├── tickets.js          # Ticket system: panel, categories, claim/close, transcripts, inactivity sweep
+│   ├── sheets.js           # All Google Sheets reads/writes + cell styling + auto-ID + retry/backoff + Verified Players tab
+│   ├── tickets.js          # Ticket system: panel, categories, claim/close/priority, transcripts, inactivity sweep
 │   ├── ai.js               # Claude-powered whitelist application review
-│   ├── embeds.js           # Builds the Discord embeds (ban, war, appeal, lookups, banlist, stats, tickets)
-│   ├── duration.js         # Parses ban durations → computes expiry (pure, unit-tested)
+│   ├── mojang.js           # Mojang IGN→UUID verification + IGN extraction from free-text applications
+│   ├── embeds.js           # Builds the Discord embeds (ban, war, lookups, stats, tickets, warnings, notes, flags, reports)
+│   ├── duration.js         # Parses ban/mute durations → computes expiry (pure, unit-tested)
 │   ├── banState.js         # Tracks lifted/unbanned bans in data/bans.json
+│   ├── warnings.js         # /warn store (data/warnings.json)
+│   ├── notes.js            # Staff notes store keyed by player IGN (data/notes.json)
+│   ├── flags.js            # Alt-detection flags + whitelist applicant log (data/flags.json)
+│   ├── report.js           # Pure aggregation for /leaderboard + the weekly staff report
 │   └── stats.js            # Pure aggregation for /stats (bans/wars summaries)
 ├── test/                   # node --test unit tests for the pure helpers (run with `npm test`)
-├── data/                   # Runtime state (ticket counters/category IDs, unban records) — gitignored
+├── data/                   # Runtime state (ticket counters/categories, unbans, warnings, notes, flags) — gitignored
 ├── credentials.json        # Google service-account key — NEVER commit (gitignored)
 ├── .env                    # Secrets — NEVER commit (gitignored)
 ├── .env.example            # Template showing which env vars are needed
@@ -206,8 +236,27 @@ TICKET_INACTIVITY_WARN_HOURS=0  # Warn at this many idle hours before auto-close
 
 # ── Whitelist ──
 MEMBER_ROLE_ID=         # Role granted on whitelist approval (AI auto-approve or /wl-accept)
+VERIFIED_ROLE_ID=       # Extra "verified" role granted on approval (defaults to MEMBER_ROLE_ID)
 ANTHROPIC_API_KEY=      # Claude API key for AI whitelist review (blank = manual review only)
+VERIFIED_SHEET_NAME=Verified Players  # Sheet tab for verified IGN↔UUID (auto-created)
+
+# ── Moderation / utility ──
+WARN_BAN_THRESHOLD=3    # Warnings at/above this make /warn suggest a ban
+APPEAL_REMINDER_HOURS=48  # Hours an open, unclaimed ban appeal can sit before a reminder posts (0 = off)
+
+# ── Alt detection & flags ──
+MIN_ACCOUNT_AGE_DAYS=30 # Flag whitelist applicants whose Discord account is younger than this
+REJOIN_WINDOW_DAYS=14   # Flag a new applicant if a ban ended/was lifted within this many days
 ```
+
+**Minecraft verification:** when a whitelist applicant submits, the bot extracts their
+IGN and verifies it against the Mojang API. A confirmed *unknown username* (HTTP 404)
+blocks the submission with a "resubmit" message; a Mojang outage does **not** block.
+Verified IGN/UUID are written to the **Verified Players** tab and, on approval, the
+bot grants `VERIFIED_ROLE_ID` and sets the member's nickname to their IGN.
+
+**Scheduled jobs:** appeal reminders run every 12h; the **weekly staff report** posts
+to the ban-log channel on/after **Monday 09:00 (server time)**.
 
 > To copy channel/role IDs in Discord: **User Settings → Advanced → Developer Mode**,
 > then right-click a channel/role → *Copy ID*.

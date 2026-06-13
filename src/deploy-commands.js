@@ -115,6 +115,86 @@ const commands = [
     .addStringOption(o => o.setName('team').setDescription('Team / player name to search for').setRequired(true))
     .toJSON(),
 
+  // ── Moderation / utility ──────────────────────────────────────────────────────
+  // /mute — temporary Discord timeout (no logging).
+  new SlashCommandBuilder()
+    .setName('mute')
+    .setDescription('Temporarily time out a member (Discord timeout)')
+    .setDMPermission(false)
+    .addUserOption(o => o.setName('user').setDescription('Member to time out').setRequired(true))
+    .addStringOption(o => o.setName('duration').setDescription('Duration, e.g. 10m / 2h / 1d (max 28d)').setRequired(true))
+    .addStringOption(o => o.setName('reason').setDescription('Reason (audit log only)').setRequired(false))
+    .toJSON(),
+
+  // /warn — issue a formal warning (stored locally, DMs the user).
+  new SlashCommandBuilder()
+    .setName('warn')
+    .setDescription('Issue a formal warning to a user (DMs them)')
+    .setDMPermission(false)
+    .addUserOption(o => o.setName('user').setDescription('User to warn').setRequired(true))
+    .addStringOption(o => o.setName('reason').setDescription('Reason for the warning').setRequired(false))
+    .toJSON(),
+
+  // /warnings — view a user's warning history.
+  new SlashCommandBuilder()
+    .setName('warnings')
+    .setDescription("View a user's warning history")
+    .setDMPermission(false)
+    .addUserOption(o => o.setName('user').setDescription('User to look up').setRequired(true))
+    .toJSON(),
+
+  // /note — attach a private staff note to a player username.
+  new SlashCommandBuilder()
+    .setName('note')
+    .setDescription('Attach a private staff note to a player username')
+    .setDMPermission(false)
+    .addStringOption(o => o.setName('player').setDescription('Minecraft username (IGN)').setRequired(true))
+    .addStringOption(o => o.setName('text').setDescription('The note text').setRequired(true))
+    .toJSON(),
+
+  // /notes — list staff notes for a player.
+  new SlashCommandBuilder()
+    .setName('notes')
+    .setDescription('List staff notes for a player username')
+    .setDMPermission(false)
+    .addStringOption(o => o.setName('player').setDescription('Minecraft username (IGN)').setRequired(true))
+    .toJSON(),
+
+  // /flags — view unresolved alt-detection flags.
+  new SlashCommandBuilder()
+    .setName('flags')
+    .setDescription('View unresolved alt-detection flags (paged)')
+    .setDMPermission(false)
+    .toJSON(),
+
+  // /resolve-flag — mark a flag resolved.
+  new SlashCommandBuilder()
+    .setName('resolve-flag')
+    .setDescription('Mark an alt-detection flag as resolved')
+    .setDMPermission(false)
+    .addIntegerOption(o => o.setName('flag_id').setDescription('Flag ID (the number shown in /flags)').setRequired(true))
+    .addStringOption(o => o.setName('note').setDescription('Optional resolution note').setRequired(false))
+    .toJSON(),
+
+  // /leaderboard — ranked staff by bans logged.
+  new SlashCommandBuilder()
+    .setName('leaderboard')
+    .setDescription('Show the staff ban leaderboard (toggle This Week / All Time)')
+    .setDMPermission(false)
+    .toJSON(),
+
+  // /priority — set the current ticket's priority level.
+  new SlashCommandBuilder()
+    .setName('priority')
+    .setDescription("Set this ticket's priority level")
+    .setDMPermission(false)
+    .addStringOption(o => o.setName('level').setDescription('Priority level').setRequired(true).addChoices(
+      { name: 'Low', value: 'low' },
+      { name: 'Normal', value: 'normal' },
+      { name: 'Urgent', value: 'urgent' },
+    ))
+    .toJSON(),
+
   // ── Ticket system ───────────────────────────────────────────────────────────
   // /ticket-panel — admins post the control panel (auto-creates categories).
   new SlashCommandBuilder()
@@ -178,16 +258,24 @@ const commands = [
     .addUserOption(o => o.setName('user').setDescription('The user to whitelist').setRequired(true))
     .toJSON(),
 
-  // /help — command reference.
+  // /help — show the player help board privately.
   new SlashCommandBuilder()
     .setName('help')
-    .setDescription('Open the help center (member & staff guides, ticket rules)')
+    .setDescription('Show the player help & info guide (private to you)')
     .toJSON(),
 
-  // /help-panel — admins post the public help center.
+  // /info-panel — admins post the player help board (e.g. in #info).
   new SlashCommandBuilder()
-    .setName('help-panel')
-    .setDescription('Post the public help panel (member + staff guides, ticket rules)')
+    .setName('info-panel')
+    .setDescription('Post the player Help & Info board in this channel (admin)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .setDMPermission(false)
+    .toJSON(),
+
+  // /staff-panel — admins post the staff handbook (e.g. in the staff channel).
+  new SlashCommandBuilder()
+    .setName('staff-panel')
+    .setDescription('Post the staff handbook board in this channel (admin)')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .setDMPermission(false)
     .toJSON(),
