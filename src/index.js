@@ -15,6 +15,7 @@ const notes = require('./notes');
 const flags = require('./flags');
 const mojang = require('./mojang');
 const report = require('./report');
+const roster = require('./roster');
 const { computeBanEnd, parseDurationMs } = require('./duration');
 const {
   buildBanEmbed,
@@ -51,6 +52,34 @@ const {
   buildWeeklyReportEmbed,
   buildPriorityEmbed,
   buildAppealReminderEmbed,
+  buildRosterProfileEmbed,
+  buildRosterListEmbed,
+  buildEligibleListEmbed,
+  buildStaffActionDmEmbed,
+  buildStaffActionLogEmbed,
+  buildStaffPardonLogEmbed,
+  buildStaffRecordEmbed,
+  buildEscalationEmbed,
+  buildOnboardDmEmbed,
+  buildOnboardLogEmbed,
+  buildPriorTerminationWarnEmbed,
+  buildOffboardLogEmbed,
+  buildRosterEditLogEmbed,
+  buildSuspendDmEmbed,
+  buildSuspendLogEmbed,
+  buildReinstateDmEmbed,
+  buildReinstateLogEmbed,
+  buildSuspensionListEmbed,
+  buildTerminateDmEmbed,
+  buildTerminateLogEmbed,
+  buildQuotaStatusEmbed,
+  buildActivityStatusEmbed,
+  buildLoaRequestEmbed,
+  buildLoaDecisionDmEmbed,
+  buildLoaLogEmbed,
+  buildLoaListEmbed,
+  buildAutoStrikeDmEmbed,
+  buildRosterDigestEmbed,
 } = require('./embeds');
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -85,6 +114,19 @@ const APPEAL_REMINDER_HOURS = parseFloat(process.env.APPEAL_REMINDER_HOURS || '4
 const APPEAL_REMINDER_SWEEP_MS = 12 * 60 * 60 * 1000; // every 12 hours
 const WEEKLY_REPORT_SWEEP_MS = 30 * 60 * 1000;        // check every 30 minutes
 const MAX_TIMEOUT_MS = 28 * 24 * 60 * 60 * 1000;      // Discord timeout ceiling (28d)
+
+// ── Staff Roster config ───────────────────────────────────────────────────────
+const STAFF_LOG_CHANNEL_ID = process.env.STAFF_LOG_CHANNEL_ID || '';
+const SUSPENDED_ROLE_ID = process.env.SUSPENDED_ROLE_ID || '';
+// Permanent quota-exemption role — OPT-IN only. (It must NOT fall back to
+// MEMBER_ROLE_ID: staff normally also hold the member role, so that fallback
+// silently exempted everyone and made the weekly quota meaningless.)
+const STAFF_EXEMPT_ROLE_ID = process.env.STAFF_EXEMPT_ROLE_ID || '';
+const ROSTER_SHEET_NAME = process.env.ROSTER_SHEET_NAME || '';
+const ROSTER_MIRROR_MS = Math.max(5, parseInt(process.env.ROSTER_MIRROR_INTERVAL_MINUTES || '60', 10) || 60) * 60 * 1000;
+const ROSTER_SWEEP_MS = 30 * 60 * 1000;               // roster maintenance sweep (every 30 min)
+const LOA_REMINDER_MS = 48 * 60 * 60 * 1000;          // unactioned LOA reminder threshold (48h)
+const TIER_LABELS = { 1: 'Staff', 2: 'Senior Staff', 3: 'Super Staff' };
 
 // ── Client ────────────────────────────────────────────────────────────────────
 const client = new Client({
@@ -228,6 +270,30 @@ client.once(Events.ClientReady, async c => {
   setTimeout(runWeekly, 60_000);
   setInterval(runWeekly, WEEKLY_REPORT_SWEEP_MS);
 
+  // Staff roster maintenance: Monday quota + digest, suspension expiry, 48h LOA
+  // reminders, and tier reconcile — all on the existing Monday-report timezone.
+  const runRosterSweeps = () => {
+    for (const guild of client.guilds.cache.values()) {
+      runRosterMaintenance(guild).catch(err => console.error('Roster maintenance failed:', err));
+    }
+  };
+  setTimeout(runRosterSweeps, 90_000);
+  setInterval(runRosterSweeps, ROSTER_SWEEP_MS);
+
+  // Read-only Google-Sheet mirror of the roster (optional; degrades to off when
+  // the tab name is unconfigured — never blocks commands or crashes).
+  if (!ROSTER_SHEET_NAME) {
+    console.log('⚠️  Staff Roster sheet tab not configured — the roster mirror is disabled until you create the tab and set ROSTER_SHEET_NAME in .env.');
+  } else {
+    const runMirror = () => {
+      for (const guild of client.guilds.cache.values()) {
+        refreshRosterMirror(guild).catch(err => console.error('Roster mirror refresh failed:', err));
+      }
+    };
+    setTimeout(runMirror, 120_000);
+    setInterval(runMirror, ROSTER_MIRROR_MS);
+  }
+
   await reportStartupConfig(c);
 });
 
@@ -271,6 +337,7 @@ client.on(Events.InteractionCreate, async interaction => {
       if (interaction.customId.startsWith('ticket:')) return await handleTicketButton(interaction);
       if (interaction.customId.startsWith('pg:')) return await handlePaginatorButton(interaction);
       if (interaction.customId.startsWith('lb:')) return await handleLeaderboardButton(interaction);
+      if (interaction.customId.startsWith('roster:')) return await handleRosterButton(interaction);
       return;
     }
 
@@ -310,6 +377,29 @@ client.on(Events.InteractionCreate, async interaction => {
       case 'info-panel':    return await handleInfoPanel(interaction);
       case 'staff-panel':   return await handleStaffPanel(interaction);
       case 'ping':          return await handlePing(interaction);
+      // ── Staff Roster ──
+      case 'roster':           return await handleRoster(interaction);
+      case 'roster-list':      return await handleRosterList(interaction);
+      case 'eligible':         return await handleEligible(interaction);
+      case 'staff-warn':       return await handleStaffWarn(interaction);
+      case 'staff-strike':     return await handleStaffStrike(interaction);
+      case 'staff-pardon':     return await handleStaffPardon(interaction);
+      case 'staff-record':     return await handleStaffRecord(interaction);
+      case 'roster-onboard':   return await handleRosterOnboard(interaction);
+      case 'roster-offboard':  return await handleRosterOffboard(interaction);
+      case 'roster-edit':      return await handleRosterEdit(interaction);
+      case 'suspend':          return await handleSuspend(interaction);
+      case 'suspend-lift':     return await handleSuspendLift(interaction);
+      case 'suspension-list':  return await handleSuspensionList(interaction);
+      case 'terminate':        return await handleTerminate(interaction);
+      case 'quota-status':     return await handleQuotaStatus(interaction);
+      case 'activity-toggle':  return await handleActivityToggle(interaction);
+      case 'activity-status':  return await handleActivityStatus(interaction);
+      case 'loa-request':      return await handleLoaRequest(interaction);
+      case 'loa-approve':      return await handleLoaApprove(interaction);
+      case 'loa-deny':         return await handleLoaDeny(interaction);
+      case 'loa-end':          return await handleLoaEnd(interaction);
+      case 'loa-list':         return await handleLoaList(interaction);
     }
   } catch (err) {
     console.error(`Error handling interaction (${interaction.commandName || interaction.customId}):`, err);
@@ -445,7 +535,8 @@ async function handleTicketButton(interaction) {
     const canClose = tickets.isStaff(interaction.member) || interaction.user.id === meta.ownerId;
     if (!canClose) return interaction.update({ content: '❌ You cannot close this ticket.', components: [] });
     await interaction.update({ content: '🔒 Closing ticket…', components: [] });
-    return tickets.closeTicket(interaction.channel, interaction.member, null, client);
+    creditTicketClose(await tickets.closeTicket(interaction.channel, interaction.member, null, client));
+    return;
   }
 
   if (id === 'ticket:closeCancel') {
@@ -855,7 +946,7 @@ async function handleTicketClose(interaction) {
 
   const reason = interaction.options.getString('reason');
   await interaction.reply({ content: '🔒 Closing ticket…', ephemeral: true });
-  return tickets.closeTicket(interaction.channel, interaction.member, reason, client);
+  creditTicketClose(await tickets.closeTicket(interaction.channel, interaction.member, reason, client));
 }
 
 // ── /log-ban ──────────────────────────────────────────────────────────────────
@@ -969,6 +1060,7 @@ async function finalizeBan(userId, { reason } = {}) {
     // Write the row first to assign the ban ID; the permanent evidence link is
     // filled in (column G) after we post the screenshots below.
     const banId = await withTimeout(sheets.appendBan(banData, []), 15000);
+    roster.creditActivity(banData.staff_id, 'bans'); // staff activity (no-op if not on roster)
 
     const formatted = { ...banData, ban_id: banId };
 
@@ -1296,6 +1388,7 @@ async function handleLogWar(interaction) {
   };
 
   await withTimeout(sheets.appendWar(warData), 15000);
+  roster.creditActivity(interaction.user.id, 'wars'); // staff activity (no-op if not on roster)
 
   const embed = buildWarEmbed(warData, `<@${interaction.user.id}>`);
 
@@ -1367,6 +1460,7 @@ async function handleWarn(interaction) {
   await interaction.deferReply({ ephemeral: true });
 
   const { count } = warnings.addWarning(user.id, { by: interaction.user.id, byTag: interaction.user.tag, reason });
+  roster.creditActivity(interaction.user.id, 'warnsIssued'); // staff activity (no-op if not on roster)
 
   let dmOk = true;
   try {
@@ -1681,6 +1775,724 @@ async function checkWeeklyReport(guild) {
   const weekLabel = `${prevMonday.toISOString().slice(0, 10)} – ${weekStart.toISOString().slice(0, 10)}`;
   await channel.send({ embeds: [buildWeeklyReportEmbed(data, { weekLabel })] }).catch(() => {});
   tickets.setLastWeeklyReport(guild.id, mondayIso);
+}
+
+// ══ Staff Roster ════════════════════════════════════════════════════════════════
+// Thin handlers: parse the interaction, gate on roster.getStaffTier, call the
+// roster.* logic + embeds.* builders, do the Discord side effects (roles/DMs/log),
+// reply. All heavy lifting lives in src/roster.js (state) and src/embeds.js (UI).
+
+// Permission gate — replies ephemerally and returns false when below tier `n`.
+// Call BEFORE deferReply.
+function requireTier(interaction, n) {
+  if (roster.getStaffTier(interaction.member) >= n) return true;
+  const msg = `❌ You need **${TIER_LABELS[n] || `tier ${n}`}** (or higher) to use this command.`;
+  if (interaction.deferred || interaction.replied) interaction.editReply(msg).catch(() => {});
+  else interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
+  return false;
+}
+
+function superRoleIds() { return roster.roleConfig().super; }
+function seniorRoleIds() { return roster.roleConfig().senior; }
+
+// All configured role IDs to GRANT for a tier (decision: grant all in the list).
+function tierRoleIds(tier) {
+  const cfg = roster.roleConfig();
+  return tier === 3 ? cfg.super : tier === 2 ? cfg.senior : tier === 1 ? cfg.staff : [];
+}
+// Every configured staff-tier role ID across all tiers (stripped on suspend/terminate).
+function allTierRoleIds() {
+  const cfg = roster.roleConfig();
+  return [...new Set([...cfg.staff, ...cfg.senior, ...cfg.super])];
+}
+function existingRoleIds(guild, idArr) {
+  return [...new Set(idArr)].filter(id => id && guild.roles.cache.has(id));
+}
+// The exact tier role IDs a member currently holds (snapshotted on suspend).
+function heldTierRoleIds(member) {
+  const all = new Set(allTierRoleIds());
+  return [...member.roles.cache.keys()].filter(id => all.has(id));
+}
+async function addRoles(member, idArr, reason) {
+  const valid = existingRoleIds(member.guild, idArr);
+  if (valid.length) await member.roles.add(valid, reason);
+}
+async function removeRoles(member, idArr, reason) {
+  const valid = existingRoleIds(member.guild, idArr).filter(id => member.roles.cache.has(id));
+  if (valid.length) await member.roles.remove(valid, reason);
+}
+
+async function staffLogChannel() {
+  if (!STAFF_LOG_CHANNEL_ID) return null;
+  return client.channels.fetch(STAFF_LOG_CHANNEL_ID).catch(() => null);
+}
+// Posts an embed to the staff log. `ping` = role IDs to mention. Never throws.
+async function logStaff(embed, { ping = [] } = {}) {
+  const ch = await staffLogChannel();
+  if (!ch) return;
+  const roles = existingRoleIds(ch.guild, ping);
+  await ch.send({
+    content: roles.length ? roles.map(r => `<@&${r}>`).join(' ') : undefined,
+    embeds: [embed],
+    allowedMentions: { roles },
+  }).catch(() => {});
+}
+
+// Display status for the /roster profile (suspended/loa, else exempt-by-role, else active).
+function displayStatusKey(entry, member) {
+  if (entry.status === 'suspended') return 'suspended';
+  if (entry.status === 'loa') return 'loa';
+  if (member && STAFF_EXEMPT_ROLE_ID && member.roles.cache.has(STAFF_EXEMPT_ROLE_ID)) return 'exempt';
+  return 'active';
+}
+// This-week status chip for the roster list (✅/❌/EXEMPT/LOA/SUSPENDED).
+function weekStatusLabel(entry, member) {
+  if (entry.status === 'suspended') return '⛔ SUSPENDED';
+  if (entry.status === 'loa') return '🌙 LOA';
+  if (member && STAFF_EXEMPT_ROLE_ID && member.roles.cache.has(STAFF_EXEMPT_ROLE_ID)) return '🛡️ EXEMPT';
+  return roster.meetsQuota(entry.currentWeek) ? '✅' : '❌';
+}
+function daysLeftInWeek(now = Date.now()) {
+  const ws = report.startOfWeek(new Date(now)).getTime();
+  return Math.max(0, Math.ceil((ws + 7 * 86_400_000 - now) / 86_400_000));
+}
+// Credits each roster-member participant of a closed ticket (no-op for non-members).
+function creditTicketClose(result) {
+  if (!result || !Array.isArray(result.participants)) return;
+  for (const uid of result.participants) {
+    if (roster.getEntry(uid)) roster.creditActivity(uid, 'tickets');
+  }
+}
+// Reply helper that works after either deferReply (slash) or update (button).
+function editOrReply(interaction, content) {
+  if (interaction.deferred || interaction.replied) return interaction.editReply({ content, embeds: [], components: [] }).catch(() => {});
+  return interaction.reply({ content, ephemeral: true }).catch(() => {});
+}
+
+// ── Roster viewing ──────────────────────────────────────────────────────────────
+async function handleRoster(interaction) {
+  const target = interaction.options.getUser('user');
+  const self = !target || target.id === interaction.user.id;
+  if (!self && !requireTier(interaction, 2)) return;
+  await interaction.deferReply({ ephemeral: true });
+  const userId = self ? interaction.user.id : target.id;
+  const entry = roster.getEntry(userId);
+  if (!entry) return interaction.editReply(self ? '❌ You are not on the staff roster.' : `❌ <@${userId}> is not on the staff roster.`);
+  const member = await interaction.guild.members.fetch(userId).catch(() => null);
+  return interaction.editReply({ embeds: [buildRosterProfileEmbed({
+    tier: entry.tier,
+    displayName: member?.displayName || target?.username || userId,
+    tag: member?.user?.tag || target?.tag || userId,
+    statusKey: displayStatusKey(entry, member),
+    tenureDays: roster.effectiveTenureDays(entry),
+    activeWarns: roster.activeWarns(entry),
+    activeStrikes: roster.activeStrikes(entry),
+    lifetime: entry.lifetime,
+    quota: entry.currentWeek,
+    req: roster.quotaConfig(),
+    history: entry.history,
+    eligibility: roster.computeEligibility(entry),
+    activityEnabled: roster.isActivityEnabled(),
+  })] });
+}
+
+async function handleRosterList(interaction) {
+  if (!requireTier(interaction, 2)) return;
+  await interaction.deferReply({ ephemeral: true });
+  const members = roster.allMembers();
+  if (!members.length) return interaction.editReply('📋 No staff are on the roster yet. Onboard someone with `/roster-onboard`.');
+  members.sort((a, b) => (b.tier - a.tier) || (roster.effectiveTenureDays(b) - roster.effectiveTenureDays(a)));
+  const rows = [];
+  for (const m of members) {
+    const gm = await interaction.guild.members.fetch(m.discordId).catch(() => null);
+    rows.push({ tier: m.tier, tag: gm?.user?.tag || m.discordId, statusLabel: weekStatusLabel(m, gm), activeStrikes: roster.activeStrikes(m) });
+  }
+  return replyPaginated(interaction, paginateEmbeds(rows, 10, (slice, page, totalPages) =>
+    buildRosterListEmbed({ rows: slice, page, totalPages, total: rows.length })));
+}
+
+async function handleEligible(interaction) {
+  if (!requireTier(interaction, 2)) return;
+  await interaction.deferReply({ ephemeral: true });
+  const rows = [];
+  for (const m of roster.allMembers()) {
+    if (m.status !== 'active') continue;
+    const elig = roster.computeEligibility(m);
+    if (!elig.eligible) continue;
+    const gm = await interaction.guild.members.fetch(m.discordId).catch(() => null);
+    rows.push({ tier: m.tier, tag: gm?.user?.tag || m.discordId, tenureDays: elig.tenureDays });
+  }
+  if (!rows.length) return interaction.editReply('⭐ No staff currently meet all promotion criteria.');
+  rows.sort((a, b) => b.tier - a.tier);
+  return replyPaginated(interaction, paginateEmbeds(rows, 12, (slice, page, totalPages) =>
+    buildEligibleListEmbed({ rows: slice, page, totalPages, total: rows.length })));
+}
+
+// Generic pager: splits `items` into pages of `per`, building each embed via `make`.
+function paginateEmbeds(items, per, make) {
+  const totalPages = Math.max(1, Math.ceil(items.length / per));
+  const embeds = [];
+  for (let i = 0; i < items.length; i += per) embeds.push(make(items.slice(i, i + per), embeds.length, totalPages));
+  return embeds.length ? embeds : [make([], 0, 1)];
+}
+
+// ── Staff discipline ────────────────────────────────────────────────────────────
+async function handleStaffDiscipline(interaction, kind) {
+  if (!requireTier(interaction, 3)) return;
+  const target = interaction.options.getUser('user');
+  const reason = interaction.options.getString('reason') || '';
+  await interaction.deferReply({ ephemeral: true });
+  const entry = roster.getEntry(target.id);
+  if (!entry) return interaction.editReply(`❌ <@${target.id}> is not on the staff roster.`);
+  if (!roster.canActOn(roster.getStaffTier(interaction.member), entry.tier)) {
+    return interaction.editReply('❌ You can only discipline staff of a strictly lower tier than yourself.');
+  }
+  const res = kind === 'strike'
+    ? roster.addStrike(target.id, { reason, issuerId: interaction.user.id })
+    : roster.addWarn(target.id, { reason, issuerId: interaction.user.id });
+  if (!res.ok) return interaction.editReply('❌ Could not record that — the member may have just been removed.');
+  const threshold = kind === 'strike' ? roster.thresholds().strike : roster.thresholds().warn;
+  let dmOk = true;
+  try {
+    const u = await client.users.fetch(target.id);
+    await u.send({ embeds: [buildStaffActionDmEmbed({ kind, guildName: interaction.guild?.name, reason, activeCount: res.activeCount, threshold })] });
+  } catch { dmOk = false; }
+  await logStaff(buildStaffActionLogEmbed({ kind, targetMention: `<@${target.id}>`, issuerMention: `<@${interaction.user.id}>`, reason, id: res.item.id, activeCount: res.activeCount }));
+  if (res.activeCount >= threshold) {
+    await logStaff(buildEscalationEmbed({ targetMention: `<@${target.id}>`, kind, count: res.activeCount, threshold }), { ping: superRoleIds() });
+  }
+  bumpRosterMirror(interaction.guild);
+  return interaction.editReply(`${kind === 'strike' ? '⛔' : '⚠️'} Recorded ${kind} \`#${res.item.id}\` for <@${target.id}> — **${res.activeCount}** active.${dmOk ? '' : ' _(Could not DM them.)_'}`);
+}
+function handleStaffWarn(i) { return handleStaffDiscipline(i, 'warn'); }
+function handleStaffStrike(i) { return handleStaffDiscipline(i, 'strike'); }
+
+async function handleStaffPardon(interaction) {
+  if (!requireTier(interaction, 3)) return;
+  const target = interaction.options.getUser('user');
+  const type = interaction.options.getString('type');
+  const id = interaction.options.getInteger('id');
+  await interaction.deferReply({ ephemeral: true });
+  if (!roster.getEntry(target.id)) return interaction.editReply(`❌ <@${target.id}> is not on the staff roster.`);
+  const res = roster.pardon(target.id, type, id);
+  if (!res.ok) return interaction.editReply('❌ Could not pardon — member not found.');
+  if (!res.found) return interaction.editReply(`❌ No ${type} with ID \`#${id}\` on <@${target.id}>'s record.`);
+  await logStaff(buildStaffPardonLogEmbed({ type, id, targetMention: `<@${target.id}>`, issuerMention: `<@${interaction.user.id}>` }));
+  bumpRosterMirror(interaction.guild);
+  return interaction.editReply(`✅ Pardoned ${type} \`#${id}\` for <@${target.id}>.`);
+}
+
+async function handleStaffRecord(interaction) {
+  const target = interaction.options.getUser('user');
+  const self = !target || target.id === interaction.user.id;
+  if (!self && !requireTier(interaction, 2)) return;
+  await interaction.deferReply({ ephemeral: true });
+  const userId = self ? interaction.user.id : target.id;
+  const entry = roster.getEntry(userId);
+  if (!entry) return interaction.editReply(self ? '❌ You are not on the staff roster.' : `❌ <@${userId}> is not on the staff roster.`);
+  const gm = await interaction.guild.members.fetch(userId).catch(() => null);
+  return interaction.editReply({ embeds: [buildStaffRecordEmbed({ tag: gm?.user?.tag || target?.tag || userId, warns: entry.warns, strikes: entry.strikes })] });
+}
+
+// ── Lifecycle ───────────────────────────────────────────────────────────────────
+async function handleRosterOnboard(interaction) {
+  if (!requireTier(interaction, 3)) return;
+  if (!(await ensureBotCanManageRoles(interaction))) return;
+  const target = interaction.options.getUser('user');
+  const tier = interaction.options.getInteger('tier');
+  await interaction.deferReply({ ephemeral: true });
+  if (roster.getEntry(target.id)) return interaction.editReply(`❌ <@${target.id}> is already on the staff roster.`);
+  const archived = roster.getArchiveEntry(target.id);
+  if (archived && archived.terminated) {
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`roster:onboard:${target.id}:${tier}`).setLabel('Confirm onboard').setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId('roster:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+    );
+    return interaction.editReply({ embeds: [buildPriorTerminationWarnEmbed({ tag: target.tag, date: archived.timestamp, reason: archived.reason })], components: [row] });
+  }
+  return finalizeOnboard(interaction, target.id, tier);
+}
+
+async function finalizeOnboard(interaction, userId, tier) {
+  const res = roster.onboard(userId, { tier, onboardedBy: interaction.user.id });
+  if (!res.ok) return editOrReply(interaction, `❌ <@${userId}> is already on the roster.`);
+  const member = await interaction.guild.members.fetch(userId).catch(() => null);
+  let note = '';
+  const roleIds = tierRoleIds(tier);
+  if (!roleIds.length) {
+    // No role IDs configured for this tier (e.g. blank SUPER_ROLE_IDS) — the roster
+    // entry is created, but no Discord role can be granted. Flag it so it's not silent.
+    note = ` _(no role IDs configured for ${TIER_LABELS[tier]} — set the matching \`*_ROLE_IDS\` in .env to grant the role)_`;
+  } else if (member) {
+    try { await addRoles(member, roleIds, `Onboarded as ${TIER_LABELS[tier]} by ${interaction.user.tag}`); }
+    catch { note = ' _(couldn’t assign all tier roles — check my role position)_'; }
+  }
+  try { const u = await client.users.fetch(userId); await u.send({ embeds: [buildOnboardDmEmbed({ guildName: interaction.guild?.name, tier })] }); } catch {}
+  await logStaff(buildOnboardLogEmbed({ targetMention: `<@${userId}>`, tier, byMention: `<@${interaction.user.id}>` }));
+  bumpRosterMirror(interaction.guild);
+  return editOrReply(interaction, `🎉 Onboarded <@${userId}> as **${TIER_LABELS[tier]}**.${note}`);
+}
+
+async function handleRosterOffboard(interaction) {
+  if (!requireTier(interaction, 3)) return;
+  const target = interaction.options.getUser('user');
+  const reason = interaction.options.getString('reason') || '';
+  await interaction.deferReply({ ephemeral: true });
+  const entry = roster.getEntry(target.id);
+  if (!entry) return interaction.editReply(`❌ <@${target.id}> is not on the staff roster.`);
+  if (!roster.canActOn(roster.getStaffTier(interaction.member), entry.tier)) return interaction.editReply('❌ You can only offboard staff of a strictly lower tier than yourself.');
+  const member = await interaction.guild.members.fetch(target.id).catch(() => null);
+  if (member) { try { await removeRoles(member, allTierRoleIds(), `Offboarded by ${interaction.user.tag}`); } catch {} }
+  roster.offboard(target.id, { reason, actionedBy: interaction.user.id });
+  await logStaff(buildOffboardLogEmbed({ targetMention: `<@${target.id}>`, byMention: `<@${interaction.user.id}>`, reason }));
+  bumpRosterMirror(interaction.guild);
+  return interaction.editReply(`👋 Offboarded <@${target.id}> — archived (clean exit).`);
+}
+
+async function handleRosterEdit(interaction) {
+  if (!requireTier(interaction, 3)) return;
+  const target = interaction.options.getUser('user');
+  const field = interaction.options.getString('field');
+  const value = interaction.options.getString('value');
+  await interaction.deferReply({ ephemeral: true });
+  if (!roster.getEntry(target.id)) return interaction.editReply(`❌ <@${target.id}> is not on the staff roster.`);
+  const res = roster.editField(target.id, field, value);
+  if (!res.ok) {
+    const why = res.reason === 'bad_field' ? 'that field can’t be edited' : res.reason === 'bad_value' ? 'invalid value for that field' : 'member not found';
+    return interaction.editReply(`❌ Could not edit — ${why}.`);
+  }
+  await logStaff(buildRosterEditLogEmbed({ targetMention: `<@${target.id}>`, byMention: `<@${interaction.user.id}>`, field, value: res.value }));
+  bumpRosterMirror(interaction.guild);
+  return interaction.editReply(`✏️ Updated \`${field}\` for <@${target.id}> → \`${res.value}\`.${field === 'tier' ? ' _(Discord roles unchanged — adjust manually if needed.)_' : ''}`);
+}
+
+async function handleSuspend(interaction) {
+  if (!requireTier(interaction, 3)) return;
+  if (!(await ensureBotCanManageRoles(interaction))) return;
+  const target = interaction.options.getUser('user');
+  const durationStr = interaction.options.getString('duration') || '';
+  const reason = interaction.options.getString('reason') || '';
+  await interaction.deferReply({ ephemeral: true });
+  const entry = roster.getEntry(target.id);
+  if (!entry) return interaction.editReply(`❌ <@${target.id}> is not on the staff roster.`);
+  if (entry.status === 'suspended') return interaction.editReply(`❌ <@${target.id}> is already suspended.`);
+  if (!roster.canActOn(roster.getStaffTier(interaction.member), entry.tier)) return interaction.editReply('❌ You can only suspend staff of a strictly lower tier than yourself.');
+  let durationMs = null;
+  if (durationStr) {
+    durationMs = parseDurationMs(durationStr);
+    if (!durationMs || durationMs <= 0) return interaction.editReply('❌ I couldn’t parse that duration. Try `7d`, `48h`, or leave it blank for an indefinite suspension.');
+  }
+  const member = await interaction.guild.members.fetch(target.id).catch(() => null);
+  const priorRoles = member ? heldTierRoleIds(member) : tierRoleIds(entry.tier);
+  const res = roster.suspend(target.id, { reason, issuerId: interaction.user.id, durationMs, priorRoles });
+  const endIso = res.entry.suspension?.end || null;
+  if (member) {
+    try {
+      await removeRoles(member, allTierRoleIds(), `Suspended by ${interaction.user.tag}`);
+      if (SUSPENDED_ROLE_ID && member.guild.roles.cache.has(SUSPENDED_ROLE_ID)) await member.roles.add(SUSPENDED_ROLE_ID, 'Suspended');
+    } catch {}
+  }
+  try { const u = await client.users.fetch(target.id); await u.send({ embeds: [buildSuspendDmEmbed({ guildName: interaction.guild?.name, reason, endIso })] }); } catch {}
+  await logStaff(buildSuspendLogEmbed({ targetMention: `<@${target.id}>`, byMention: `<@${interaction.user.id}>`, reason, endIso }));
+  bumpRosterMirror(interaction.guild);
+  return interaction.editReply(`⛔ Suspended <@${target.id}>${endIso ? ` until <t:${Math.floor(Date.parse(endIso) / 1000)}:F>` : ' indefinitely'}.${SUSPENDED_ROLE_ID ? '' : ' _(No SUSPENDED_ROLE_ID set — tier roles stripped only.)_'}`);
+}
+
+async function handleSuspendLift(interaction) {
+  if (!requireTier(interaction, 3)) return;
+  if (!(await ensureBotCanManageRoles(interaction))) return;
+  const target = interaction.options.getUser('user');
+  await interaction.deferReply({ ephemeral: true });
+  const entry = roster.getEntry(target.id);
+  if (!entry || entry.status !== 'suspended') return interaction.editReply(`❌ <@${target.id}> is not currently suspended.`);
+  await doReinstate(interaction.guild, target.id, { auto: false, byMention: `<@${interaction.user.id}>` });
+  return interaction.editReply(`🟢 Reinstated <@${target.id}> with their previous role(s).`);
+}
+
+// Shared reinstatement (manual lift or auto-expiry) — restores the EXACT prior roles.
+async function doReinstate(guild, userId, { auto, byMention }) {
+  const res = roster.reinstate(userId);
+  if (!res.ok) return;
+  const member = await guild.members.fetch(userId).catch(() => null);
+  if (member) {
+    try {
+      if (SUSPENDED_ROLE_ID && member.roles.cache.has(SUSPENDED_ROLE_ID)) await member.roles.remove(SUSPENDED_ROLE_ID, 'Suspension ended');
+      if (res.priorRoles?.length) await addRoles(member, res.priorRoles, 'Suspension ended — roles restored');
+    } catch (err) { console.error('Reinstate role restore failed:', err.message); }
+  }
+  try { const u = await client.users.fetch(userId); await u.send({ embeds: [buildReinstateDmEmbed({ guildName: guild.name })] }); } catch {}
+  await logStaff(buildReinstateLogEmbed({ targetMention: `<@${userId}>`, byMention, auto }));
+  bumpRosterMirror(guild);
+}
+
+async function handleSuspensionList(interaction) {
+  if (!requireTier(interaction, 2)) return;
+  await interaction.deferReply({ ephemeral: true });
+  const susp = roster.allMembers().filter(m => m.status === 'suspended');
+  if (!susp.length) return interaction.editReply('✅ No staff are currently suspended.');
+  const rows = [];
+  for (const m of susp) {
+    const gm = await interaction.guild.members.fetch(m.discordId).catch(() => null);
+    rows.push({ tag: gm?.user?.tag || m.discordId, endIso: m.suspension?.end || null, reason: m.suspension?.reason || '' });
+  }
+  return replyPaginated(interaction, paginateEmbeds(rows, 8, (slice, page, totalPages) =>
+    buildSuspensionListEmbed({ rows: slice, page, totalPages, total: rows.length })));
+}
+
+const pendingTerminations = new Collection();
+
+async function handleTerminate(interaction) {
+  if (!requireTier(interaction, 3)) return;
+  const target = interaction.options.getUser('user');
+  const reason = interaction.options.getString('reason') || '';
+  await interaction.deferReply({ ephemeral: true });
+  const entry = roster.getEntry(target.id);
+  if (!entry) return interaction.editReply(`❌ <@${target.id}> is not on the staff roster.`);
+  if (!roster.canActOn(roster.getStaffTier(interaction.member), entry.tier)) return interaction.editReply('❌ You can only terminate staff of a strictly lower tier than yourself.');
+  pendingTerminations.set(target.id, { reason, byId: interaction.user.id });
+  setTimeout(() => pendingTerminations.delete(target.id), 120_000);
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`roster:terminate:${target.id}`).setLabel('Confirm termination').setEmoji('🛑').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId('roster:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+  );
+  return interaction.editReply({ content: `⚠️ Confirm termination of <@${target.id}>? This permanently removes them and archives the record.`, components: [row] });
+}
+
+async function finalizeTerminate(interaction, userId, reason) {
+  const entry = roster.getEntry(userId);
+  if (!entry) return editOrReply(interaction, '❌ That member is no longer on the roster.');
+  const member = await interaction.guild.members.fetch(userId).catch(() => null);
+  if (member) {
+    const strip = [...allTierRoleIds()];
+    if (SUSPENDED_ROLE_ID) strip.push(SUSPENDED_ROLE_ID);
+    // Strip the exempt role too — UNLESS it's the base member role (the default),
+    // which we must never remove on termination.
+    if (STAFF_EXEMPT_ROLE_ID && STAFF_EXEMPT_ROLE_ID !== (process.env.MEMBER_ROLE_ID || '')) strip.push(STAFF_EXEMPT_ROLE_ID);
+    try { await removeRoles(member, strip, `Terminated by ${interaction.user.tag}`); } catch {}
+  }
+  roster.terminate(userId, { reason, actionedBy: interaction.user.id });
+  try { const u = await client.users.fetch(userId); await u.send({ embeds: [buildTerminateDmEmbed({ guildName: interaction.guild?.name, reason })] }); } catch {}
+  await logStaff(buildTerminateLogEmbed({ targetMention: `<@${userId}>`, byMention: `<@${interaction.user.id}>`, reason }), { ping: superRoleIds() });
+  bumpRosterMirror(interaction.guild);
+  return editOrReply(interaction, `🛑 Terminated <@${userId}> — archived.`);
+}
+
+// ── Activity / quota ────────────────────────────────────────────────────────────
+async function handleQuotaStatus(interaction) {
+  const target = interaction.options.getUser('user');
+  const self = !target || target.id === interaction.user.id;
+  if (!self && !requireTier(interaction, 2)) return;
+  await interaction.deferReply({ ephemeral: true });
+  const userId = self ? interaction.user.id : target.id;
+  const entry = roster.getEntry(userId);
+  if (!entry) return interaction.editReply(self ? '❌ You are not on the staff roster.' : `❌ <@${userId}> is not on the staff roster.`);
+  const gm = await interaction.guild.members.fetch(userId).catch(() => null);
+  return interaction.editReply({ embeds: [buildQuotaStatusEmbed({
+    tag: gm?.user?.tag || target?.tag || userId,
+    quota: entry.currentWeek,
+    req: roster.quotaConfig(),
+    daysLeft: daysLeftInWeek(),
+    activityEnabled: roster.isActivityEnabled(),
+    exempt: roster.isExempt(entry, gm),
+  })] });
+}
+
+async function handleActivityToggle(interaction) {
+  if (!requireTier(interaction, 3)) return;
+  const state = interaction.options.getString('state');
+  await interaction.deferReply({ ephemeral: true });
+  const enabled = roster.setActivityEnabled(state === 'on');
+  await logStaff(buildActivityStatusEmbed({ enabled, req: roster.quotaConfig() }));
+  return interaction.editReply(`${enabled ? '🟢' : '⏸️'} Activity / quota system turned **${enabled ? 'ON' : 'OFF'}**.`);
+}
+
+async function handleActivityStatus(interaction) {
+  await interaction.deferReply({ ephemeral: true });
+  return interaction.editReply({ embeds: [buildActivityStatusEmbed({ enabled: roster.isActivityEnabled(), req: roster.quotaConfig() })] });
+}
+
+// ── LOA ───────────────────────────────────────────────────────────────────────
+async function handleLoaRequest(interaction) {
+  if (!requireTier(interaction, 1)) return;
+  const reason = interaction.options.getString('reason') || '';
+  const returnDate = interaction.options.getString('return_date') || '';
+  await interaction.deferReply({ ephemeral: true });
+  const entry = roster.getEntry(interaction.user.id);
+  if (!entry) return interaction.editReply('❌ You are not on the staff roster, so you can’t request LOA.');
+  if (entry.status === 'loa') return interaction.editReply('❌ You are already on LOA.');
+  if (entry.loa?.pending) return interaction.editReply('❌ You already have a pending LOA request.');
+  const ch = await staffLogChannel();
+  if (!ch) return interaction.editReply('❌ No staff-log channel is configured (STAFF_LOG_CHANNEL_ID), so LOA requests can’t be posted for approval.');
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`roster:loaApprove:${interaction.user.id}`).setLabel('Approve').setEmoji('✅').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`roster:loaDeny:${interaction.user.id}`).setLabel('Deny').setEmoji('⛔').setStyle(ButtonStyle.Danger),
+  );
+  const seniors = seniorRoleIds();
+  const msg = await ch.send({
+    content: seniors.map(r => `<@&${r}>`).join(' ') || undefined,
+    embeds: [buildLoaRequestEmbed({ requesterMention: `<@${interaction.user.id}>`, reason, returnDate })],
+    components: [row],
+    allowedMentions: { roles: existingRoleIds(ch.guild, seniors) },
+  }).catch(() => null);
+  roster.loaRequest(interaction.user.id, { reason, returnDate: returnDate || null, requesterId: interaction.user.id, messageId: msg?.id || null });
+  return interaction.editReply('🌙 Your LOA request has been submitted for senior-staff approval.');
+}
+
+// Applies an approve/deny decision (shared by buttons + slash commands).
+async function applyLoaDecision(userId, approved, byId, guild, denyReason = '') {
+  const entry = roster.getEntry(userId);
+  const reqReason = entry?.loa?.reason || '';
+  const returnDate = entry?.loa?.returnDate || '';
+  if (approved) roster.loaApprove(userId, { by: byId });
+  else roster.loaDeny(userId);
+  try { const u = await client.users.fetch(userId); await u.send({ embeds: [buildLoaDecisionDmEmbed({ approved, guildName: guild?.name, reason: approved ? reqReason : denyReason, returnDate })] }); } catch {}
+  await logStaff(buildLoaLogEmbed({ kind: approved ? 'approved' : 'denied', targetMention: `<@${userId}>`, byMention: `<@${byId}>`, reason: approved ? reqReason : denyReason, returnDate }));
+  if (approved) bumpRosterMirror(guild); // status → LOA changes the dashboard
+}
+
+async function handleLoaApprove(interaction) {
+  if (!requireTier(interaction, 2)) return;
+  const target = interaction.options.getUser('user');
+  await interaction.deferReply({ ephemeral: true });
+  const entry = roster.getEntry(target.id);
+  if (!entry || !entry.loa || !entry.loa.pending) return interaction.editReply(`❌ <@${target.id}> has no pending LOA request.`);
+  await applyLoaDecision(target.id, true, interaction.user.id, interaction.guild);
+  return interaction.editReply(`✅ Approved <@${target.id}>'s LOA.`);
+}
+
+async function handleLoaDeny(interaction) {
+  if (!requireTier(interaction, 2)) return;
+  const target = interaction.options.getUser('user');
+  const reason = interaction.options.getString('reason') || '';
+  await interaction.deferReply({ ephemeral: true });
+  const entry = roster.getEntry(target.id);
+  if (!entry || !entry.loa || !entry.loa.pending) return interaction.editReply(`❌ <@${target.id}> has no pending LOA request.`);
+  await applyLoaDecision(target.id, false, interaction.user.id, interaction.guild, reason);
+  return interaction.editReply(`⛔ Denied <@${target.id}>'s LOA.`);
+}
+
+async function handleLoaEnd(interaction) {
+  const target = interaction.options.getUser('user');
+  const self = !target || target.id === interaction.user.id;
+  if (!self && !requireTier(interaction, 2)) return;
+  await interaction.deferReply({ ephemeral: true });
+  const userId = self ? interaction.user.id : target.id;
+  const entry = roster.getEntry(userId);
+  if (!entry) return interaction.editReply(self ? '❌ You are not on the staff roster.' : `❌ <@${userId}> is not on the staff roster.`);
+  const res = roster.loaEnd(userId);
+  if (!res.wasLoa) return interaction.editReply(self ? 'ℹ️ You are not currently on LOA.' : `ℹ️ <@${userId}> is not currently on LOA.`);
+  await logStaff(buildLoaLogEmbed({ kind: 'ended', targetMention: `<@${userId}>`, byMention: `<@${interaction.user.id}>` }));
+  bumpRosterMirror(interaction.guild);
+  return interaction.editReply(`🟢 LOA ended for <@${userId}> — tenure resumes.`);
+}
+
+async function handleLoaList(interaction) {
+  if (!requireTier(interaction, 2)) return;
+  await interaction.deferReply({ ephemeral: true });
+  const loa = roster.allMembers().filter(m => m.status === 'loa');
+  if (!loa.length) return interaction.editReply('✅ No staff are currently on LOA.');
+  const rows = [];
+  for (const m of loa) {
+    const gm = await interaction.guild.members.fetch(m.discordId).catch(() => null);
+    rows.push({ tag: gm?.user?.tag || m.discordId, returnDate: m.loa?.returnDate || '', reason: m.loa?.reason || '' });
+  }
+  return replyPaginated(interaction, paginateEmbeds(rows, 8, (slice, page, totalPages) =>
+    buildLoaListEmbed({ rows: slice, page, totalPages, total: rows.length })));
+}
+
+// ── Roster buttons (onboard-confirm / terminate-confirm / LOA approve-deny) ───────
+async function handleRosterButton(interaction) {
+  const parts = interaction.customId.split(':'); // roster:<action>:<...>
+  const action = parts[1];
+
+  if (action === 'cancel') {
+    return interaction.update({ content: '✅ Cancelled.', embeds: [], components: [] }).catch(() => {});
+  }
+
+  if (action === 'onboard') {
+    if (roster.getStaffTier(interaction.member) < 3) return interaction.reply({ content: '❌ Super Staff only.', ephemeral: true });
+    await interaction.update({ content: '⏳ Onboarding…', embeds: [], components: [] }).catch(() => {});
+    return finalizeOnboard(interaction, parts[2], parseInt(parts[3], 10));
+  }
+
+  if (action === 'terminate') {
+    if (roster.getStaffTier(interaction.member) < 3) return interaction.reply({ content: '❌ Super Staff only.', ephemeral: true });
+    const userId = parts[2];
+    const pending = pendingTerminations.get(userId);
+    pendingTerminations.delete(userId);
+    await interaction.update({ content: '⏳ Terminating…', embeds: [], components: [] }).catch(() => {});
+    return finalizeTerminate(interaction, userId, pending?.reason || '');
+  }
+
+  if (action === 'loaApprove' || action === 'loaDeny') {
+    if (roster.getStaffTier(interaction.member) < 2) return interaction.reply({ content: '❌ Only Senior Staff or above can action LOA requests.', ephemeral: true });
+    const userId = parts[2];
+    const entry = roster.getEntry(userId);
+    if (!entry || !entry.loa || !entry.loa.pending) {
+      return interaction.update({ components: [] }).catch(() => {});
+    }
+    await applyLoaDecision(userId, action === 'loaApprove', interaction.user.id, interaction.guild);
+    await interaction.update({ components: [] }).catch(() => {}); // keep embed, drop buttons
+    return interaction.followUp({ content: `${action === 'loaApprove' ? '✅ Approved' : '⛔ Denied'} <@${userId}>'s LOA.`, ephemeral: true }).catch(() => {});
+  }
+}
+
+// ── Roster cron jobs (Monday-report timezone) ───────────────────────────────────
+async function runRosterMaintenance(guild) {
+  await checkSuspensionExpiry(guild).catch(err => console.error('Suspension expiry check failed:', err));
+  await checkLoaReminders(guild).catch(err => console.error('LOA reminder check failed:', err));
+  await reconcileGuildTiers(guild).catch(err => console.error('Tier reconcile failed:', err));
+  await checkRosterQuota(guild).catch(err => console.error('Quota check failed:', err));
+}
+
+// Hourly-ish: reinstate suspensions whose end time has passed (exact prior-tier restore).
+async function checkSuspensionExpiry(guild) {
+  for (const m of roster.expiredSuspensions()) {
+    await doReinstate(guild, m.discordId, { auto: true });
+  }
+}
+
+// 48h: ping senior staff about LOA requests still pending.
+async function checkLoaReminders(guild) {
+  const pending = roster.pendingLoaRequests(LOA_REMINDER_MS);
+  if (!pending.length) return;
+  const ch = await staffLogChannel();
+  if (!ch) return;
+  const now = Date.now();
+  const seniors = seniorRoleIds();
+  for (const m of pending) {
+    if (now - (m.loa?.lastReminderAt || 0) < LOA_REMINDER_MS) continue; // throttle
+    roster.setLoaReminderAt(m.discordId, now);
+    await ch.send({
+      content: seniors.map(r => `<@&${r}>`).join(' ') || undefined,
+      embeds: [buildLoaLogEmbed({ kind: 'requested', targetMention: `<@${m.discordId}>`, reason: '⏰ Still awaiting approval (48h+). Please review.' })],
+      allowedMentions: { roles: existingRoleIds(ch.guild, seniors) },
+    }).catch(() => {});
+  }
+}
+
+// Detect MANUAL promotions/demotions (role changes) for active members and resync tier.
+async function reconcileGuildTiers(guild) {
+  const cfg = roster.roleConfig();
+  // A tier whose role IDs are unconfigured can't be represented by any Discord role,
+  // so role-based reconcile is blind to it. Never auto-demote a member OFF such a
+  // tier (e.g. a Super Staffer when SUPER_ROLE_IDS is blank) — that's the bug that
+  // turned freshly-onboarded Super Staff into Senior on the next sweep.
+  const tierHasRoles = t => (t === 3 ? cfg.super : t === 2 ? cfg.senior : cfg.staff).length > 0;
+  for (const m of roster.allMembers()) {
+    if (m.status !== 'active') continue;
+    if (!tierHasRoles(m.tier)) continue;
+    const gm = await guild.members.fetch(m.discordId).catch(() => null);
+    if (!gm) continue;
+    const rt = roster.roleTier(gm);
+    if (rt < 1 || rt === m.tier) continue;
+    const res = roster.reconcileTier(m.discordId, rt);
+    if (res?.changed) {
+      await logStaff(buildRosterEditLogEmbed({ targetMention: `<@${m.discordId}>`, byMention: 'Auto-reconcile', field: 'tier', value: `${res.from} → ${res.to} (role change detected — tenure reset)` }));
+    }
+  }
+}
+
+// Monday 09:00: quota check + auto-strikes + week roll + extended digest.
+async function checkRosterQuota(guild) {
+  const now = new Date();
+  const weekStart = report.startOfWeek(now);
+  const trigger = new Date(weekStart);
+  trigger.setHours(9, 0, 0, 0);
+  if (now < trigger) return;
+  const mondayIso = weekStart.toISOString().slice(0, 10);
+  if (roster.getMeta().lastQuotaRun === mondayIso) return; // already ran this week
+
+  const prevMonday = new Date(weekStart);
+  prevMonday.setDate(prevMonday.getDate() - 7);
+  const prevMondayIso = prevMonday.toISOString().slice(0, 10);
+  const weekLabel = `${prevMondayIso} – ${mondayIso}`;
+  const activityEnabled = roster.isActivityEnabled();
+
+  const failed = [];
+  const loaList = [];
+  const suspendedList = [];
+  const exemptList = [];
+  let totalWarns = 0;
+  let totalStrikes = 0;
+
+  for (const m of roster.allMembers()) {
+    const gm = await guild.members.fetch(m.discordId).catch(() => null);
+    const tag = gm?.user?.tag || m.discordId;
+    totalWarns += roster.activeWarns(m);
+    totalStrikes += roster.activeStrikes(m);
+
+    const exemptRole = !!(gm && STAFF_EXEMPT_ROLE_ID && gm.roles.cache.has(STAFF_EXEMPT_ROLE_ID));
+    const exempt = roster.isExempt(m, gm); // loa OR suspended OR exempt-role
+
+    // Categorise once for the digest (no duplicates).
+    if (m.status === 'loa') loaList.push(tag);
+    else if (m.status === 'suspended') suspendedList.push(tag);
+    else if (exemptRole) exemptList.push(tag);
+
+    const passed = exempt ? true : roster.meetsQuota(m.currentWeek);
+    if (!exempt && !passed && activityEnabled) {
+      const res = roster.addStrike(m.discordId, { reason: `Failed weekly activity quota — week of ${prevMondayIso}`, auto: true });
+      failed.push(tag);
+      if (gm) { try { await gm.user.send({ embeds: [buildAutoStrikeDmEmbed({ guildName: guild.name, weekLabel, activeCount: res.activeCount })] }); } catch {} }
+      await logStaff(buildStaffActionLogEmbed({ kind: 'strike', targetMention: `<@${m.discordId}>`, issuerMention: 'Automatic (quota)', reason: `Failed weekly activity quota — week of ${prevMondayIso}`, id: res.item.id, activeCount: res.activeCount }));
+    }
+    roster.rollMemberWeek(m.discordId, { passed, exempt });
+  }
+
+  roster.setLastQuotaRun(mondayIso);
+  await logStaff(buildRosterDigestEmbed({ weekLabel, failed, loa: loaList, suspended: suspendedList, exempt: exemptList, totalWarns, totalStrikes, activityEnabled }));
+  await refreshRosterMirror(guild).catch(() => {}); // refresh the sheet right after the digest
+}
+
+// ── Google-Sheet mirror orchestration (Stage 5) ─────────────────────────────────
+// Fire-and-forget refresh after a roster change so the dashboard updates near-
+// instantly instead of waiting for the next scheduled sweep (up to an hour away).
+// Never awaited, never throws — a sheet hiccup must not affect the command reply.
+function bumpRosterMirror(guild) {
+  if (!ROSTER_SHEET_NAME || !guild) return;
+  refreshRosterMirror(guild).catch(err => console.error('Roster mirror refresh failed:', err.message));
+}
+
+// Assembles a read-only snapshot of the active roster and hands it to
+// sheets.writeRosterMirror. No-op when the tab name is unconfigured.
+async function refreshRosterMirror(guild) {
+  if (!ROSTER_SHEET_NAME) return;
+  const members = roster.allMembers();
+  members.sort((a, b) => (b.tier - a.tier) || (roster.effectiveTenureDays(b) - roster.effectiveTenureDays(a)));
+  // Quota column reflects what's actually configured. With no WEEKLY_QUOTA_* set
+  // (the default), meetsQuota() is vacuously true — showing "Met" for someone who
+  // has done nothing is misleading, so we show a neutral "N/A" (untracked) until
+  // real quotas exist. A configured quota a fresh member hasn't hit shows "Missed".
+  const q = roster.quotaConfig();
+  const quotaTracked = q.bans > 0 || q.wars > 0 || q.tickets > 0 || q.warnsIssued > 0;
+  const rows = [];
+  for (const m of members) {
+    const gm = await guild.members.fetch(m.discordId).catch(() => null);
+    const exemptRole = !!(gm && STAFF_EXEMPT_ROLE_ID && gm.roles.cache.has(STAFF_EXEMPT_ROLE_ID));
+    const statusKey = m.status === 'suspended' ? 'suspended' : m.status === 'loa' ? 'loa' : exemptRole ? 'exempt' : 'active';
+    const exempt = roster.isExempt(m, gm);
+    const quotaState = exempt ? 'exempt'
+      : !quotaTracked ? 'untracked'
+      : roster.meetsQuota(m.currentWeek, q) ? 'met' : 'missed';
+    rows.push({
+      onboardDate: (m.staffJoinDate || '').slice(0, 10),
+      tag: gm?.user?.tag || m.discordId,
+      tier: m.tier,
+      statusKey,
+      quotaState,
+      warns: roster.activeWarns(m),
+      strikes: roster.activeStrikes(m),
+      eligible: roster.computeEligibility(m).eligible,
+      tenureDays: roster.effectiveTenureDays(m),
+    });
+  }
+  try {
+    const ok = await sheets.writeRosterMirror(rows, { sheetName: ROSTER_SHEET_NAME });
+    if (ok === false) console.log(`⚠️  Roster mirror: sheet tab "${ROSTER_SHEET_NAME}" not found — create it (and match ROSTER_SHEET_NAME) to enable the mirror.`);
+  } catch (err) {
+    console.error('Roster mirror write failed:', err.message);
+  }
 }
 
 // ── Process-level safety net ────────────────────────────────────────────────────

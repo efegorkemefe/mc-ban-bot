@@ -13,6 +13,9 @@ An all-in-one Discord bot for a Minecraft community:
 4. **Moderation toolkit** — `/mute` timeouts, `/warn` warnings (with DMs), private
    `/note`s on players, an alt-detection **flag** system, a staff **leaderboard**, and
    an automatic **weekly staff report**.
+5. **Staff Roster** — a three-tier staff model (Staff / Senior / Super) with
+   onboarding, discipline (warns/strikes), LOA & suspension, weekly activity quotas,
+   and passive promotion-eligibility — mirrored to a read-only **Staff Roster** sheet.
 
 Everything is **rebrandable** via `.env` (name, colour, icon), so it isn't tied to
 one server. This README gets a new developer up to speed quickly — no deep Discord
@@ -38,6 +41,8 @@ Two Google Sheet tabs are used inside one spreadsheet:
 |-----|----------------|
 | **Ban Logs** | Every ban (date, staff, player, offense, severity, duration, evidence, ID, appeal status) |
 | **War & Raid Approvals** | Every war/raid request and its approval status |
+| **Verified Players** | Verified Minecraft accounts (Discord ↔ IGN ↔ UUID), auto-created |
+| **Staff Roster** _(optional)_ | A read-only **display mirror** of the staff roster — `data/roster.json` is the source of truth, never read back |
 
 ---
 
@@ -140,6 +145,12 @@ These colours/fonts are sampled directly from the example rows and live in
 `src/sheets.js` (`THEME`, `SEVERITY_CELL`, `STATUS_CELL`). If you restyle the sheet,
 update those constants to match.
 
+The **Staff Roster** mirror tab matches the same example-row look — full tier names
+(`Staff` / `Senior Staff` / `Super Staff`), plain word stamps (no emojis), subtle cell
+dividers, tenure as `"<n> Days"`, and a gold **"Eligible for Promotion"** stamp. Its
+styling is kept in **separate** constants (`TIER_CELL`, `ROSTER_STATUS_CELL`,
+`QUOTA_CELL`, `PROMO_CELL`, `TIER_LABEL`) so restyling one tab never affects the other.
+
 ### Column order
 
 **Ban Logs:** `A Date · B Staff · C Player · D Offense · E Severity · F Duration · G Evidence · H Ban ID · I Appeal Status`
@@ -155,8 +166,9 @@ mc-ban-bot/
 ├── src/
 │   ├── index.js            # Bot entry point: routes slash commands + ticket buttons, evidence flow, schedulers
 │   ├── deploy-commands.js  # Registers the slash commands with Discord (run once)
-│   ├── sheets.js           # All Google Sheets reads/writes + cell styling + auto-ID + retry/backoff + Verified Players tab
+│   ├── sheets.js           # All Google Sheets reads/writes + cell styling + auto-ID + retry/backoff + Verified Players + Staff Roster mirror
 │   ├── tickets.js          # Ticket system: panel, categories, claim/close/priority, transcripts, inactivity sweep
+│   ├── roster.js           # Staff Roster: three-tier permissions, discipline, LOA/suspension, quotas, promotion (atomic JSON state)
 │   ├── ai.js               # Claude-powered whitelist application review
 │   ├── mojang.js           # Mojang IGN→UUID verification + IGN extraction from free-text applications
 │   ├── embeds.js           # Builds the Discord embeds (ban, war, lookups, stats, tickets, warnings, notes, flags, reports)
@@ -247,7 +259,25 @@ APPEAL_REMINDER_HOURS=48  # Hours an open, unclaimed ban appeal can sit before a
 # ── Alt detection & flags ──
 MIN_ACCOUNT_AGE_DAYS=30 # Flag whitelist applicants whose Discord account is younger than this
 REJOIN_WINDOW_DAYS=14   # Flag a new applicant if a ban ended/was lifted within this many days
+
+# ── Staff Roster (optional) ──
+SUPER_ROLE_IDS=         # Tier-3 role IDs (required to onboard Super Staff; admins also count via Administrator)
+STAFF_EXEMPT_ROLE_ID=   # Opt-in quota-exemption role. Blank = nobody auto-exempt. Do NOT set to MEMBER_ROLE_ID
+SUSPENDED_ROLE_ID=      # Role applied while a staffer is suspended (tier roles are stripped)
+STAFF_LOG_CHANNEL_ID=   # Channel for discipline / LOA / roster logs (blank = skipped)
+STAFF_WARN_THRESHOLD=3  # Active warns at/above this auto-alert Super Staff
+STAFF_STRIKE_THRESHOLD=2 # Active strikes at/above this auto-alert Super Staff
+WEEKLY_QUOTA_BANS=0     # Per-week activity targets (0 = not tracked → mirror shows "N/A")
+WEEKLY_QUOTA_WARS=0
+WEEKLY_QUOTA_TICKETS=0
+WEEKLY_QUOTA_WARNS=0
+ROSTER_SHEET_NAME=      # Sheet tab for the read-only roster mirror (blank = disabled; the tab must exist first)
+ROSTER_MIRROR_INTERVAL_MINUTES=60  # How often the roster mirror tab is rewritten
 ```
+
+> The full set of Staff Roster knobs (promotion thresholds, etc.) is in
+> [`.env.example`](.env.example); see **[`USAGE.md`](USAGE.md)** for the commands and
+> automated jobs (weekly quota check, suspension expiry, LOA reminders, tier reconcile).
 
 **Minecraft verification:** when a whitelist applicant submits, the bot extracts their
 IGN and verifies it against the Mojang API. A confirmed *unknown username* (HTTP 404)

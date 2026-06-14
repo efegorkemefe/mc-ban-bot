@@ -46,6 +46,15 @@ or — if that's blank — anyone with the **Manage Server** permission. A secon
 (Staff Reports, Urgent tickets, HIGH/CRITICAL/PERMANENT bans), and can force-release
 another staffer's claim.
 
+**The three-tier staff model.** The [Staff Roster](#staff-roster) gates on a single
+function, `getStaffTier(member)`, which returns a tier `0–3`: **3 = Super Staff**
+(`SUPER_ROLE_IDS`, or anyone with the **Administrator** permission), **2 = Senior
+Staff** (`SENIOR_ROLE_IDS`), **1 = Staff** (`STAFF_ROLE_IDS`), **0 = not staff**. A
+member's tier is the **highest** tier role they hold. Acting on *another* staffer
+(discipline, suspend, offboard, terminate) requires your tier to be **strictly
+higher** than theirs. `SUPER_ROLE_IDS` must be set to onboard Super Staff — if it's
+blank, the entry is created but no Super role can be granted.
+
 **Permissions the bot itself needs** (give its role these, and drag it **above** the
 member/ticket roles):
 
@@ -125,6 +134,37 @@ Run these **inside a ticket channel** unless noted.
 
 Notes and unresolved flags for a player are **also shown automatically** whenever
 their IGN appears in `/lookup-ban`, `/history`, or `/notes`.
+
+### Staff Roster
+
+The roster tracks staff membership, tier, discipline, activity quotas, LOA, and
+suspensions in `data/roster.json`, and mirrors a read-only dashboard to the **Staff
+Roster** sheet tab. "Senior+" = tier 2 or 3; "Super only" = tier 3. You can only act
+on staff of a **strictly lower** tier than your own.
+
+| Command | Who | Notes |
+|---------|-----|-------|
+| `/roster [user]` | Self any; others senior+ | View a staff profile: tier, status, tenure, quota progress, warns/strikes, promotion eligibility. |
+| `/roster-list` | Senior+ | Paged overview of all active staff (tier, this-week quota, strikes). |
+| `/eligible` | Senior+ | Staff who currently meet **all** promotion criteria (passive flag — the bot never auto-promotes). |
+| `/roster-onboard user tier` | Super only | Add someone to the roster at **Staff / Senior Staff / Super Staff** and grant that tier's role(s). Requires the matching `*_ROLE_IDS` to grant a role. |
+| `/roster-offboard user [reason]` | Super only | Clean voluntary exit — strips tier roles, archives the record. |
+| `/terminate user [reason]` | Super only | Permanent removal for cause (button-confirmed). Re-onboarding a terminated member warns first. |
+| `/roster-edit user field value` | Super only | Manually correct `tier` / `tenureStart` / `staffJoinDate` / `status` (a tier change resets tenure; roles are **not** auto-changed). |
+| `/staff-warn user [reason]` | Super only | Record a staff **warn** (DMs them); alerts Super Staff at `STAFF_WARN_THRESHOLD`. |
+| `/staff-strike user [reason]` | Super only | Record a staff **strike** (more severe); alerts at `STAFF_STRIKE_THRESHOLD`. |
+| `/staff-pardon user type id` | Super only | Pardon a specific warn/strike by ID (see `/staff-record`). |
+| `/staff-record [user]` | Self any; others senior+ | Full warn/strike history. |
+| `/suspend user [duration] [reason]` | Super only | Temporarily remove a staffer — strips tier roles (snapshotting the exact roles), pauses the tenure clock, applies `SUSPENDED_ROLE_ID`. Blank duration = until lifted. |
+| `/suspend-lift user` | Super only | End a suspension early and **restore the exact prior roles**. Expired suspensions auto-lift. |
+| `/suspension-list` | Senior+ | Currently suspended staff. |
+| `/loa-request [reason] [return_date]` | Any staff | Request a leave of absence (senior+ approve). |
+| `/loa-approve user` / `/loa-deny user [reason]` | Senior+ | Action a pending LOA. Approval pauses the tenure clock; unactioned requests are re-pinged after 48h. |
+| `/loa-end [user]` | Self, or senior+ for others | End an LOA and resume the tenure clock. |
+| `/loa-list` | Senior+ | Staff currently on LOA. |
+| `/quota-status [user]` | Self any; others senior+ | Weekly activity progress vs the configured quotas. |
+| `/activity-toggle on\|off` | Super only | Turn the activity/quota **auto-strike** system on or off (activity is always *tracked*; only the Monday auto-strike is gated). |
+| `/activity-status` | Any staff | Show whether tracking is on and the current weekly quotas. |
 
 ### Panels & help
 
@@ -216,6 +256,11 @@ These run on their own once configured:
 | **Appeal reminders** | Every 12h | Re-pings staff in the ban-log channel for open, **unclaimed** ban appeals older than `APPEAL_REMINDER_HOURS`. Claiming stops it. |
 | **Weekly staff report** | Monday ~09:00 server time | Posts a digest to the ban-log channel: bans/wars/tickets-closed per staff + average first-response time. |
 | **Inactivity auto-close** | Configurable | Warns then auto-closes idle tickets (`TICKET_INACTIVITY_*`). Off by default. |
+| **Weekly quota check** | Monday ~09:00 server time | Rolls each staffer's week into history and (when activity is **on** and a quota is missed) records an auto-strike. Exempt = LOA/suspended or `STAFF_EXEMPT_ROLE_ID`. With all quotas `0`, nobody is struck. |
+| **Suspension expiry** | Every ~30 min | Auto-reinstates suspensions whose duration has elapsed, restoring the exact prior roles. |
+| **LOA reminders** | Every ~30 min | Re-pings senior staff about LOA requests left unactioned for 48h+. |
+| **Tier reconcile** | Every ~30 min | Detects manual role-based promotions/demotions and resyncs the stored tier (a real change resets tenure). Never demotes off a tier whose roles aren't configured. |
+| **Roster mirror refresh** | Hourly (`ROSTER_MIRROR_INTERVAL_MINUTES`) | Rewrites the **Staff Roster** sheet tab — a read-only dashboard (tier, status, weekly quota, warns/strikes, promotion eligibility, tenure). Disabled until `ROSTER_SHEET_NAME` is set and the tab exists. |
 
 ---
 
@@ -249,6 +294,20 @@ with **Developer Mode** on (right-click → *Copy ID*).
 | `MIN_ACCOUNT_AGE_DAYS` | `30` | New-account flag threshold. |
 | `REJOIN_WINDOW_DAYS` | `14` | Ban-rejoin flag window. |
 
+### Staff Roster settings
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `STAFF_ROLE_IDS` / `SENIOR_ROLE_IDS` / `SUPER_ROLE_IDS` | _(blank)_ | Tier 1 / 2 / 3 role IDs. **`SUPER_ROLE_IDS` is required to onboard Super Staff** (server admins still count as tier 3 via the Administrator permission). |
+| `STAFF_EXEMPT_ROLE_ID` | _(blank)_ | **Opt-in** permanent quota-exemption role. Blank = nobody is auto-exempt. **Don't** set it to `MEMBER_ROLE_ID` — staff hold the member role too, which would exempt everyone. |
+| `SUSPENDED_ROLE_ID` | _(blank)_ | Role applied while suspended (configure its channel perms so suspended staff can view but not send). |
+| `STAFF_LOG_CHANNEL_ID` | _(blank)_ | Channel for discipline / LOA / roster logs (blank = logging skipped). |
+| `STAFF_WARN_THRESHOLD` / `STAFF_STRIKE_THRESHOLD` | `3` / `2` | Active warns / strikes at/above which Super Staff are auto-alerted (never auto-demotes). |
+| `WEEKLY_QUOTA_BANS` / `_WARS` / `_TICKETS` / `_WARNS` | `0` | Per-week activity targets. `0` = not tracked; a member passes the week only if **every non-zero** quota is met. With all `0`, the mirror's quota column shows **N/A**. |
+| `PROMO_MIN_TENURE_DAYS` / `PROMO_QUOTA_WEEKS_REQUIRED` / `PROMO_QUOTA_WEEKS_WINDOW` / `PROMO_MAX_WARNS` / `PROMO_MIN_LIFETIME_ACTIONS` | `30` / `6` / `8` / `2` / `0` | Promotion-eligibility thresholds (passive flag surfaced by `/eligible` — the bot never auto-promotes). |
+| `ROSTER_SHEET_NAME` | _(blank)_ | Sheet tab for the read-only roster mirror. Blank = mirror disabled (the tab must exist first). |
+| `ROSTER_MIRROR_INTERVAL_MINUTES` | `60` | How often the roster mirror tab is rewritten. |
+
 ---
 
 ## Data files
@@ -263,9 +322,12 @@ should not be committed.
 | `data/warnings.json` | `/warn` history, keyed by Discord user ID. |
 | `data/notes.json` | Staff notes, keyed by player username. |
 | `data/flags.json` | Alt-detection flags + the whitelist applicant log. |
+| `data/roster.json` | **Staff Roster** source of truth: membership, tier, discipline, activity counters, LOA/suspension, tenure. Atomic writes. |
+| `data/roster-archive.json` | Offboarded/terminated staff records (kept for re-onboard warnings). |
 
 The permanent record of bans, wars, and verified players lives in the **Google
-Sheet**, not on disk.
+Sheet**, not on disk. The Staff Roster sheet tab is a **one-way display mirror** —
+`data/roster.json` is authoritative and is never read back from the sheet.
 
 ---
 
