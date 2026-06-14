@@ -1130,6 +1130,418 @@ function buildAppealReminderEmbed({ channelMention, ageHours, ownerMention }) {
     .setTimestamp();
 }
 
+// ── Staff Roster ──────────────────────────────────────────────────────────────
+// Branded, dark-theme embeds for the staff roster (profiles, discipline,
+// lifecycle, LOA, quota, the Monday digest). All reuse brandAuthor/brandFooter +
+// BRAND_COLOR + setTimestamp so they sit visually alongside the ban/ticket embeds.
+const ROSTER_BRAND = `${BRAND_NAME} Staff Roster`;
+const TIER_LABEL = { 0: 'Not staff', 1: 'Staff', 2: 'Senior Staff', 3: 'Super Staff' };
+const TIER_EMOJI = { 1: '🔹', 2: '🔶', 3: '🟣' };
+const TIER_COLOR = { 1: 0x5865f2, 2: 0xf0883e, 3: 0xbc8cff };
+const ROSTER_STATUS = {
+  active:    { emoji: '🟢', label: 'Active',    color: 0x57c454 },
+  loa:       { emoji: '🌙', label: 'On LOA',    color: 0x768390 },
+  suspended: { emoji: '⛔', label: 'Suspended', color: 0xe84343 },
+  exempt:    { emoji: '🛡️', label: 'Exempt',    color: 0x56d4dd },
+};
+
+function tierLabel(t) {
+  return `${TIER_EMOJI[t] || '▪️'} ${TIER_LABEL[t] || '—'}`;
+}
+function rosterStatusLabel(s) {
+  const m = ROSTER_STATUS[s] || { emoji: '•', label: s || '—' };
+  return `${m.emoji} ${m.label}`;
+}
+
+// Generic branded roster embed used by most builders below.
+function rosterEmbed({ emoji = '📋', title, color = BRAND_COLOR, desc, fields = [], footer }) {
+  const e = new EmbedBuilder()
+    .setColor(color)
+    .setAuthor(brandAuthor(`${emoji} ${ROSTER_BRAND}`))
+    .setTitle(title)
+    .setFooter(brandFooter(footer || BRAND_NAME))
+    .setTimestamp();
+  if (desc) e.setDescription(desc);
+  if (fields.length) e.addFields(...fields);
+  return e;
+}
+
+// This-week quota progress vs requirements (only non-zero quotas shown).
+function formatQuotaProgress(counters = {}, req = {}) {
+  const rows = [];
+  const add = (label, key) => {
+    if (req[key] > 0) rows.push(`${(counters[key] || 0) >= req[key] ? '✅' : '❌'} ${label} **${counters[key] || 0}/${req[key]}**`);
+  };
+  add('Bans', 'bans');
+  add('Wars', 'wars');
+  add('Tickets', 'tickets');
+  add('Warns', 'warnsIssued');
+  return rows.length ? rows.join('\n') : '_No weekly quotas configured._';
+}
+
+// Last few weeks' pass/fail/exempt trend from history.
+function formatTrend(history = []) {
+  const recent = history.slice(-8);
+  if (!recent.length) return '_No history yet._';
+  return recent.map(w => (w.exempt ? '➖' : w.passed ? '✅' : '❌')).join(' ');
+}
+
+// Promotion-eligibility one-liner.
+function eligibilityLine(elig) {
+  if (!elig) return '`—`';
+  return elig.eligible ? '✅ **Eligible for promotion**' : `⏳ Not yet — ${elig.reasons.join(' · ')}`;
+}
+
+// /roster — full staff profile.
+function buildRosterProfileEmbed({ tier, displayName, tag, statusKey, tenureDays, activeWarns, activeStrikes, lifetime = {}, quota, req, history, eligibility, activityEnabled }) {
+  return rosterEmbed({
+    emoji: '🛡️',
+    color: TIER_COLOR[tier] || BRAND_COLOR,
+    title: displayName || tag,
+    desc: `${tierLabel(tier)} · ${rosterStatusLabel(statusKey)}`,
+    fields: [
+      { name: '🗓️ Tenure', value: `\`${tenureDays}d\` at current tier`, inline: true },
+      { name: '⚠️ Active warns', value: `\`${activeWarns}\``, inline: true },
+      { name: '⛔ Active strikes', value: `\`${activeStrikes}\``, inline: true },
+      { name: `📊 This week${activityEnabled ? '' : ' (tracking paused)'}`, value: formatQuotaProgress(quota, req), inline: true },
+      { name: '📈 Recent trend', value: formatTrend(history), inline: true },
+      { name: '🏅 Lifetime', value: `🔨 ${lifetime.bans || 0} · ⚔️ ${lifetime.wars || 0} · 🎫 ${lifetime.tickets || 0} · ⚠️ ${lifetime.warnsIssued || 0}`, inline: true },
+      { name: '⭐ Promotion', value: eligibilityLine(eligibility), inline: false },
+    ],
+    footer: `${BRAND_NAME} • ${tag}`,
+  });
+}
+
+// /roster-list — one page of the active roster.
+function buildRosterListEmbed({ rows = [], page = 0, totalPages = 1, total = 0 }) {
+  const body = rows.length
+    ? rows.map(r => `${tierLabel(r.tier)} — **${r.tag}** · ${r.statusLabel} · ⛔ \`${r.activeStrikes}\``).join('\n')
+    : '_No active staff on the roster yet. Onboard someone with `/roster-onboard`._';
+  return rosterEmbed({
+    emoji: '📋',
+    title: `Staff Roster — ${total} member(s)`,
+    desc: body.slice(0, 4096),
+    footer: `${BRAND_NAME} • Page ${page + 1}/${totalPages}`,
+  });
+}
+
+// /eligible — staff currently meeting promotion criteria.
+function buildEligibleListEmbed({ rows = [], page = 0, totalPages = 1, total = 0 }) {
+  const body = rows.length
+    ? rows.map(r => `✅ ${tierLabel(r.tier)} — **${r.tag}** · \`${r.tenureDays}d\` · ➡️ ${TIER_LABEL[r.tier + 1] || 'top tier'}`).join('\n')
+    : '_No staff currently meet all promotion criteria._';
+  return rosterEmbed({
+    emoji: '⭐',
+    color: 0x57c454,
+    title: `Promotion-Eligible Staff — ${total}`,
+    desc: body.slice(0, 4096),
+    footer: `${BRAND_NAME} • Advisory only — promote by assigning the role`,
+  });
+}
+
+// DM to a staffer who receives a warn/strike.
+function buildStaffActionDmEmbed({ kind, guildName, reason, activeCount, threshold }) {
+  const strike = kind === 'strike';
+  const e = new EmbedBuilder()
+    .setColor(strike ? 0xe84343 : 0xf0a500)
+    .setAuthor(brandAuthor(`${strike ? '⛔' : '⚠️'} ${ROSTER_BRAND}`))
+    .setTitle(`You received a staff ${strike ? 'strike' : 'warning'}${guildName ? ` in ${guildName}` : ''}`)
+    .setDescription(reason ? `> ${reason}` : '_No reason was provided._')
+    .addFields({ name: strike ? '⛔ Active strikes' : '⚠️ Active warns', value: `\`${activeCount}\``, inline: true })
+    .setFooter(brandFooter(BRAND_NAME))
+    .setTimestamp();
+  if (threshold && activeCount >= threshold) {
+    e.addFields({ name: '🚨 Notice', value: `You have reached the ${strike ? 'strike' : 'warning'} threshold. Senior staff have been notified.`, inline: false });
+  }
+  return e;
+}
+
+// Posted to STAFF_LOG_CHANNEL_ID when a warn/strike is issued.
+function buildStaffActionLogEmbed({ kind, targetMention, issuerMention, reason, id, activeCount }) {
+  const strike = kind === 'strike';
+  return rosterEmbed({
+    emoji: strike ? '⛔' : '⚠️',
+    color: strike ? 0xe84343 : 0xf0a500,
+    title: `Staff ${strike ? 'Strike' : 'Warning'} Issued`,
+    fields: [
+      { name: '👤 Staff member', value: targetMention, inline: true },
+      { name: '🛡️ Issued by', value: issuerMention, inline: true },
+      { name: strike ? '⛔ Active strikes' : '⚠️ Active warns', value: `\`${activeCount}\``, inline: true },
+      { name: '📋 Reason', value: (reason || '_No reason provided._').slice(0, 1024), inline: false },
+    ],
+    footer: `${BRAND_NAME} • ${strike ? 'Strike' : 'Warn'} ID: ${id}`,
+  });
+}
+
+// Posted when a warn/strike is pardoned.
+function buildStaffPardonLogEmbed({ type, id, targetMention, issuerMention }) {
+  return rosterEmbed({
+    emoji: '✅',
+    color: 0x57c454,
+    title: `Staff ${type === 'strike' ? 'Strike' : 'Warning'} Pardoned`,
+    fields: [
+      { name: '👤 Staff member', value: targetMention, inline: true },
+      { name: '🛡️ Pardoned by', value: issuerMention, inline: true },
+    ],
+    footer: `${BRAND_NAME} • ${type === 'strike' ? 'Strike' : 'Warn'} ID: ${id}`,
+  });
+}
+
+// /staff-record — warn/strike history newest-first.
+function buildStaffRecordEmbed({ tag, warns = [], strikes = [] }) {
+  const fmt = list => (list.length
+    ? list.slice().reverse().slice(0, 12).map(x =>
+        `\`#${x.id}\` ${relTime(x.timestamp)} — by ${x.issuerId ? `<@${x.issuerId}>` : 'system'}${x.auto ? ' · _auto_' : ''}${x.pardoned ? ' · ✅ _pardoned_' : ''}\n> ${(x.reason || '_no reason_').slice(0, 200)}`,
+      ).join('\n\n')
+    : '_none_');
+  return rosterEmbed({
+    emoji: '🗂️',
+    title: `Staff Record — ${tag}`,
+    fields: [
+      { name: `⚠️ Warnings (${warns.filter(w => !w.pardoned).length} active / ${warns.length} total)`, value: fmt(warns).slice(0, 1024), inline: false },
+      { name: `⛔ Strikes (${strikes.filter(s => !s.pardoned).length} active / ${strikes.length} total)`, value: fmt(strikes).slice(0, 1024), inline: false },
+    ],
+  });
+}
+
+// Auto-alert to Super Staff when a member reaches the warn/strike threshold.
+function buildEscalationEmbed({ targetMention, kind, count, threshold }) {
+  return rosterEmbed({
+    emoji: '🚨',
+    color: 0xe84343,
+    title: `Staff ${kind === 'strike' ? 'Strike' : 'Warning'} Threshold Reached`,
+    desc: `${targetMention} now has **${count}** active ${kind === 'strike' ? 'strike(s)' : 'warn(s)'} (threshold **${threshold}**). Super Staff should review — the bot takes no automatic action.`,
+    footer: `${BRAND_NAME} • Manual review required`,
+  });
+}
+
+// Welcome DM on onboarding.
+function buildOnboardDmEmbed({ guildName, tier }) {
+  return new EmbedBuilder()
+    .setColor(TIER_COLOR[tier] || BRAND_COLOR)
+    .setAuthor(brandAuthor(`🎉 ${ROSTER_BRAND}`))
+    .setTitle(`Welcome to the staff team${guildName ? ` — ${guildName}` : ''}!`)
+    .setDescription(`You've been onboarded as **${TIER_LABEL[tier]}**. Your activity and tenure are now tracked — use \`/roster\` to view your profile and \`/quota-status\` to check your weekly progress.`)
+    .setFooter(brandFooter(BRAND_NAME))
+    .setTimestamp();
+}
+
+function buildOnboardLogEmbed({ targetMention, tier, byMention }) {
+  return rosterEmbed({
+    emoji: '🎉', color: TIER_COLOR[tier] || BRAND_COLOR, title: 'Staff Onboarded',
+    fields: [
+      { name: '👤 New staff', value: targetMention, inline: true },
+      { name: '🎚️ Tier', value: tierLabel(tier), inline: true },
+      { name: '🛡️ Onboarded by', value: byMention, inline: true },
+    ],
+  });
+}
+
+// Shown (ephemerally) to the onboarder when the user was previously terminated.
+function buildPriorTerminationWarnEmbed({ tag, date, reason }) {
+  return rosterEmbed({
+    emoji: '⚠️', color: 0xe84343, title: 'Previously Terminated',
+    desc: `**${tag}** was previously **terminated**${date ? ` on ${String(date).slice(0, 10)}` : ''}.\n> ${reason || '_No reason recorded._'}\n\nPress **Confirm** to onboard them anyway.`,
+    footer: `${BRAND_NAME} • Requires confirmation`,
+  });
+}
+
+function buildOffboardLogEmbed({ targetMention, byMention, reason }) {
+  return rosterEmbed({
+    emoji: '👋', color: 0x768390, title: 'Staff Offboarded',
+    desc: 'Voluntary / clean exit — archived.',
+    fields: [
+      { name: '👤 Staff member', value: targetMention, inline: true },
+      { name: '🛡️ Offboarded by', value: byMention, inline: true },
+      { name: '📋 Reason', value: (reason || '_None given._').slice(0, 1024), inline: false },
+    ],
+  });
+}
+
+function buildRosterEditLogEmbed({ targetMention, byMention, field, value }) {
+  return rosterEmbed({
+    emoji: '✏️', title: 'Roster Entry Edited',
+    fields: [
+      { name: '👤 Staff member', value: targetMention, inline: true },
+      { name: '🛡️ Edited by', value: byMention, inline: true },
+      { name: '🔧 Change', value: `\`${field}\` → \`${String(value).slice(0, 200)}\``, inline: false },
+    ],
+  });
+}
+
+function buildSuspendDmEmbed({ guildName, reason, endIso }) {
+  return new EmbedBuilder()
+    .setColor(0xe84343)
+    .setAuthor(brandAuthor(`⛔ ${ROSTER_BRAND}`))
+    .setTitle(`You have been suspended${guildName ? ` in ${guildName}` : ''}`)
+    .setDescription(reason ? `> ${reason}` : '_No reason was provided._')
+    .addFields({ name: '🔁 Reinstated', value: endIso ? `${relTime(endIso)}` : '`Manual`', inline: false })
+    .setFooter(brandFooter(`${BRAND_NAME} • Your staff roles are temporarily removed`))
+    .setTimestamp();
+}
+
+function buildSuspendLogEmbed({ targetMention, byMention, reason, endIso }) {
+  return rosterEmbed({
+    emoji: '⛔', color: 0xe84343, title: 'Staff Suspended',
+    fields: [
+      { name: '👤 Staff member', value: targetMention, inline: true },
+      { name: '🛡️ Suspended by', value: byMention, inline: true },
+      { name: '🔁 Reinstates', value: endIso ? relTime(endIso) : '`Manual`', inline: true },
+      { name: '📋 Reason', value: (reason || '_None given._').slice(0, 1024), inline: false },
+    ],
+  });
+}
+
+function buildReinstateDmEmbed({ guildName }) {
+  return new EmbedBuilder()
+    .setColor(0x57c454)
+    .setAuthor(brandAuthor(`🟢 ${ROSTER_BRAND}`))
+    .setTitle(`Your suspension has ended${guildName ? ` — ${guildName}` : ''}`)
+    .setDescription('Your previous staff role(s) have been restored. Welcome back!')
+    .setFooter(brandFooter(BRAND_NAME))
+    .setTimestamp();
+}
+
+function buildReinstateLogEmbed({ targetMention, byMention, auto }) {
+  return rosterEmbed({
+    emoji: '🟢', color: 0x57c454, title: auto ? 'Suspension Expired — Reinstated' : 'Suspension Lifted',
+    fields: [
+      { name: '👤 Staff member', value: targetMention, inline: true },
+      { name: auto ? '⏰ Trigger' : '🛡️ Lifted by', value: auto ? 'Automatic (expiry)' : (byMention || '`—`'), inline: true },
+    ],
+  });
+}
+
+function buildSuspensionListEmbed({ rows = [], page = 0, totalPages = 1, total = 0 }) {
+  const body = rows.length
+    ? rows.map(r => `⛔ **${r.tag}** — reinstates ${r.endIso ? relTime(r.endIso) : '`manual`'}\n> ${(r.reason || '_no reason_').slice(0, 150)}`).join('\n\n')
+    : '_No staff are currently suspended._';
+  return rosterEmbed({ emoji: '⛔', color: 0xe84343, title: `Suspended Staff — ${total}`, desc: body.slice(0, 4096), footer: `${BRAND_NAME} • Page ${page + 1}/${totalPages}` });
+}
+
+function buildTerminateDmEmbed({ guildName, reason }) {
+  return new EmbedBuilder()
+    .setColor(0x8b0000)
+    .setAuthor(brandAuthor(`🛑 ${ROSTER_BRAND}`))
+    .setTitle(`Your staff position has been terminated${guildName ? ` in ${guildName}` : ''}`)
+    .setDescription(reason ? `> ${reason}` : '_No reason was provided._')
+    .setFooter(brandFooter(BRAND_NAME))
+    .setTimestamp();
+}
+
+function buildTerminateLogEmbed({ targetMention, byMention, reason }) {
+  return rosterEmbed({
+    emoji: '🛑', color: 0x8b0000, title: 'Staff Terminated',
+    desc: 'Permanent removal for cause — archived.',
+    fields: [
+      { name: '👤 Staff member', value: targetMention, inline: true },
+      { name: '🛡️ Terminated by', value: byMention, inline: true },
+      { name: '📋 Reason', value: (reason || '_None given._').slice(0, 1024), inline: false },
+    ],
+  });
+}
+
+function buildQuotaStatusEmbed({ tag, quota, req, daysLeft, activityEnabled, exempt }) {
+  return rosterEmbed({
+    emoji: '📊', title: `Weekly Quota — ${tag}`,
+    desc: activityEnabled
+      ? (exempt ? '🛡️ You are **exempt** this week — no quota penalty.' : `\`${daysLeft}\` day(s) left this week.`)
+      : '⏸️ The activity system is currently **off** — tracking continues, but no strikes are issued.',
+    fields: [{ name: '📈 Progress', value: formatQuotaProgress(quota, req), inline: false }],
+  });
+}
+
+function buildActivityStatusEmbed({ enabled, req }) {
+  const reqLines = [];
+  const add = (l, k) => { if (req[k] > 0) reqLines.push(`• ${l}: **${req[k]}/week**`); };
+  add('Bans', 'bans');
+  add('Wars', 'wars');
+  add('Tickets', 'tickets');
+  add('Warns', 'warnsIssued');
+  return rosterEmbed({
+    emoji: enabled ? '🟢' : '⏸️', color: enabled ? 0x57c454 : 0x768390,
+    title: `Activity System — ${enabled ? 'ON' : 'OFF'}`,
+    desc: enabled
+      ? 'Weekly quotas are enforced; failing non-exempt staff get an auto-strike each Monday.'
+      : 'Activity is still tracked silently, but no auto-strikes are issued while off.',
+    fields: [{ name: '🎯 Current weekly quotas', value: reqLines.length ? reqLines.join('\n') : '_None configured (all 0)._', inline: false }],
+  });
+}
+
+// LOA request posted to the staff log (Approve/Deny buttons added by index.js).
+function buildLoaRequestEmbed({ requesterMention, reason, returnDate }) {
+  return rosterEmbed({
+    emoji: '🌙', color: 0xf0a500, title: 'LOA Request',
+    desc: `${requesterMention} is requesting a leave of absence.`,
+    fields: [
+      { name: '🗓️ Return date', value: returnDate ? `\`${returnDate}\`` : '`Open-ended`', inline: true },
+      { name: '📋 Reason', value: (reason || '_None given._').slice(0, 1024), inline: false },
+    ],
+    footer: `${BRAND_NAME} • Senior staff can approve or deny below`,
+  });
+}
+
+function buildLoaDecisionDmEmbed({ approved, guildName, reason, returnDate }) {
+  return new EmbedBuilder()
+    .setColor(approved ? 0x57c454 : 0xe84343)
+    .setAuthor(brandAuthor(`🌙 ${ROSTER_BRAND}`))
+    .setTitle(`Your LOA request was ${approved ? 'approved' : 'denied'}${guildName ? ` — ${guildName}` : ''}`)
+    .setDescription(approved
+      ? `Enjoy your time off${returnDate ? ` — see you around \`${returnDate}\`` : ''}. You're exempt from quotas while away.`
+      : (reason ? `> ${reason}` : '_No reason was provided._'))
+    .setFooter(brandFooter(BRAND_NAME))
+    .setTimestamp();
+}
+
+function buildLoaLogEmbed({ kind, targetMention, byMention, reason, returnDate }) {
+  const meta = {
+    requested: { emoji: '🌙', color: 0xf0a500, title: 'LOA Requested' },
+    approved:  { emoji: '✅', color: 0x57c454, title: 'LOA Approved' },
+    denied:    { emoji: '⛔', color: 0xe84343, title: 'LOA Denied' },
+    ended:     { emoji: '🟢', color: 0x57c454, title: 'LOA Ended' },
+  }[kind] || { emoji: '🌙', color: BRAND_COLOR, title: 'LOA' };
+  const fields = [{ name: '👤 Staff member', value: targetMention, inline: true }];
+  if (byMention) fields.push({ name: '🛡️ Actioned by', value: byMention, inline: true });
+  if (returnDate) fields.push({ name: '🗓️ Return', value: `\`${returnDate}\``, inline: true });
+  if (reason) fields.push({ name: '📋 Reason', value: reason.slice(0, 1024), inline: false });
+  return rosterEmbed({ ...meta, fields });
+}
+
+function buildLoaListEmbed({ rows = [], page = 0, totalPages = 1, total = 0 }) {
+  const body = rows.length
+    ? rows.map(r => `🌙 **${r.tag}** — returns ${r.returnDate ? `\`${r.returnDate}\`` : '`open-ended`'}\n> ${(r.reason || '_no reason_').slice(0, 150)}`).join('\n\n')
+    : '_No staff are currently on LOA._';
+  return rosterEmbed({ emoji: '🌙', color: 0xf0a500, title: `Staff on LOA — ${total}`, desc: body.slice(0, 4096), footer: `${BRAND_NAME} • Page ${page + 1}/${totalPages}` });
+}
+
+function buildAutoStrikeDmEmbed({ guildName, weekLabel, activeCount }) {
+  return new EmbedBuilder()
+    .setColor(0xe84343)
+    .setAuthor(brandAuthor(`⛔ ${ROSTER_BRAND}`))
+    .setTitle(`Automatic strike — missed weekly quota${guildName ? ` in ${guildName}` : ''}`)
+    .setDescription(`You did not meet the activity quota for the week of **${weekLabel}**, so an automatic strike was issued.`)
+    .addFields({ name: '⛔ Active strikes', value: `\`${activeCount}\``, inline: true })
+    .setFooter(brandFooter(`${BRAND_NAME} • Reach out to senior staff if this is a mistake`))
+    .setTimestamp();
+}
+
+// Extended Monday digest posted to STAFF_LOG_CHANNEL_ID.
+function buildRosterDigestEmbed({ weekLabel, failed = [], loa = [], suspended = [], exempt = [], totalWarns = 0, totalStrikes = 0, activityEnabled }) {
+  const list = arr => (arr.length ? arr.map(t => `• ${t}`).join('\n').slice(0, 1024) : '_none_');
+  return rosterEmbed({
+    emoji: '📒', title: 'Staff Roster Digest',
+    desc: `Week of **${weekLabel}** · Activity system: ${activityEnabled ? '🟢 ON' : '⏸️ OFF'}`,
+    fields: [
+      { name: `❌ Missed quota (auto-struck) — ${failed.length}`, value: list(failed), inline: false },
+      { name: `🌙 On LOA — ${loa.length}`, value: list(loa), inline: true },
+      { name: `⛔ Suspended — ${suspended.length}`, value: list(suspended), inline: true },
+      { name: `🛡️ Exempt (role) — ${exempt.length}`, value: list(exempt), inline: true },
+      { name: '🧮 Active discipline totals', value: `⚠️ ${totalWarns} warn(s) · ⛔ ${totalStrikes} strike(s)`, inline: false },
+    ],
+    footer: `${BRAND_NAME} • Automated roster digest`,
+  });
+}
+
 module.exports = {
   buildBanEmbed,
   buildWarEmbed,
@@ -1173,6 +1585,35 @@ module.exports = {
   buildWeeklyReportEmbed,
   buildPriorityEmbed,
   buildAppealReminderEmbed,
+  // ── Staff Roster ──
+  buildRosterProfileEmbed,
+  buildRosterListEmbed,
+  buildEligibleListEmbed,
+  buildStaffActionDmEmbed,
+  buildStaffActionLogEmbed,
+  buildStaffPardonLogEmbed,
+  buildStaffRecordEmbed,
+  buildEscalationEmbed,
+  buildOnboardDmEmbed,
+  buildOnboardLogEmbed,
+  buildPriorTerminationWarnEmbed,
+  buildOffboardLogEmbed,
+  buildRosterEditLogEmbed,
+  buildSuspendDmEmbed,
+  buildSuspendLogEmbed,
+  buildReinstateDmEmbed,
+  buildReinstateLogEmbed,
+  buildSuspensionListEmbed,
+  buildTerminateDmEmbed,
+  buildTerminateLogEmbed,
+  buildQuotaStatusEmbed,
+  buildActivityStatusEmbed,
+  buildLoaRequestEmbed,
+  buildLoaDecisionDmEmbed,
+  buildLoaLogEmbed,
+  buildLoaListEmbed,
+  buildAutoStrikeDmEmbed,
+  buildRosterDigestEmbed,
   // ── Exported for tests ──
   parseEvidence,
   banEndShort,

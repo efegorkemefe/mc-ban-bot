@@ -29,6 +29,7 @@ const {
   buildTicketInactivityEmbed,
   applyPriorityToOpenEmbed,
 } = require('./embeds');
+const roster = require('./roster');
 
 // ── Config (from .env) ────────────────────────────────────────────────────────
 function splitIds(v) {
@@ -37,6 +38,8 @@ function splitIds(v) {
 
 const STAFF_ROLE_IDS = splitIds(process.env.STAFF_ROLE_IDS);
 const SENIOR_ROLE_IDS = splitIds(process.env.SENIOR_ROLE_IDS);
+// Super Staff (tier 3) also count as staff for ticket visibility/pings.
+const SUPER_ROLE_IDS = splitIds(process.env.SUPER_ROLE_IDS);
 const TICKET_LOG_CHANNEL_ID = process.env.TICKET_LOG_CHANNEL_ID || '';
 const STAFF_APP_MIN_DAYS = parseInt(process.env.STAFF_APP_MIN_DAYS || '7', 10);
 // Role granted to whitelisted members (on AI approval or /wl-accept).
@@ -318,16 +321,15 @@ function setLastWeeklyReport(guildId, isoMonday) {
 }
 
 // ── Role helpers ────────────────────────────────────────────────────────────────
+// Permission gating routes through the single roster.getStaffTier() so there is
+// one source of truth for tiers (Administrator ⇒ tier 3; otherwise the highest of
+// the SUPER/SENIOR/STAFF role IDs). Staff = tier ≥ 1, Senior = tier ≥ 2.
 function isStaff(member) {
-  if (!member) return false;
-  if (member.permissions?.has(PermissionFlagsBits.ManageGuild)) return true;
-  return STAFF_ROLE_IDS.some(r => member.roles.cache.has(r));
+  return roster.getStaffTier(member) >= 1;
 }
 
 function isSenior(member) {
-  if (!member) return false;
-  if (member.permissions?.has(PermissionFlagsBits.Administrator)) return true;
-  return SENIOR_ROLE_IDS.some(r => member.roles.cache.has(r));
+  return roster.getStaffTier(member) >= 2;
 }
 
 // ── Channel-topic metadata (Discord-native state) ──────────────────────────────
@@ -370,9 +372,9 @@ const OWNER_CHANNEL_PERMS = [
   PermissionFlagsBits.EmbedLinks,
 ];
 
-// All staff/senior roles that should be able to see tickets (deduplicated).
+// All staff/senior/super roles that should be able to see tickets (deduplicated).
 function allStaffRoleIds() {
-  return [...new Set([...STAFF_ROLE_IDS, ...SENIOR_ROLE_IDS])];
+  return [...new Set([...STAFF_ROLE_IDS, ...SENIOR_ROLE_IDS, ...SUPER_ROLE_IDS])];
 }
 
 // Filters a list of role IDs down to those that actually exist in the guild.
@@ -802,7 +804,10 @@ async function buildTranscript(channel, ownerId = null) {
     return `[${time} UTC] ${m.author.tag}: ${content}`.trimEnd();
   });
 
-  return { text: lines.join('\n'), count: all.length, firstResponseAt };
+  // Unique non-bot participants — used to credit staff activity on close.
+  const authorIds = [...new Set(all.filter(m => !m.author.bot).map(m => m.author.id))];
+
+  return { text: lines.join('\n'), count: all.length, firstResponseAt, authorIds };
 }
 
 function humanizeDuration(ms) {
@@ -825,8 +830,13 @@ async function closeTicket(channel, closedByMember, reason, client) {
   const claimedBy = channel.guild ? getClaim(channel.guild.id, channel.id) : null;
   if (channel.guild) setClaim(channel.guild.id, channel.id, null); // clean up state
 
-  const { text, count, firstResponseAt } = await buildTranscript(channel, meta.ownerId);
+  const { text, count, firstResponseAt, authorIds } = await buildTranscript(channel, meta.ownerId);
   const opened = channel.createdTimestamp;
+
+  // Staff to credit with this closed ticket: the claimer + anyone who sent ≥1
+  // message. The caller (index.js) filters to roster members before crediting;
+  // bot auto-closures (inactivity sweep) ignore this return value, so no credit.
+  const participants = [...new Set([...(authorIds || []), ...(claimedBy ? [claimedBy] : [])])];
 
   // Record stats for the weekly staff report (best-effort; also cleans up the
   // ticket's local state). The bot itself closing (auto-close) is recorded too,
@@ -872,6 +882,8 @@ async function closeTicket(channel, closedByMember, reason, client) {
 
   await channel.send({ embeds: [buildTicketClosingEmbed(info)] }).catch(() => {});
   setTimeout(() => channel.delete('Ticket closed').catch(() => {}), 5000);
+
+  return { participants, claimedBy: claimedBy || null };
 }
 
 // ── Post the control panel ──────────────────────────────────────────────────────

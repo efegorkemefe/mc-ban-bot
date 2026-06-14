@@ -13,6 +13,11 @@ const VERIFIED_SHEET_NAME = process.env.VERIFIED_SHEET_NAME || 'Verified Players
 // row 7 for bans and row 8 for war/raids.
 const BAN_DATA_START_ROW = parseInt(process.env.BAN_DATA_START_ROW || '7', 10);
 const WAR_DATA_START_ROW = parseInt(process.env.WAR_DATA_START_ROW || '7', 10);
+// Staff Roster mirror tab. LEFT BLANK by default — the mirror stays disabled until
+// the user creates the tab and sets ROSTER_SHEET_NAME (the API can't write to a
+// tab that doesn't exist). Real entries start at row 7, like the ban/war tabs.
+const ROSTER_SHEET_NAME = process.env.ROSTER_SHEET_NAME || '';
+const ROSTER_DATA_START_ROW = parseInt(process.env.ROSTER_DATA_START_ROW || '7', 10);
 
 // ── Theme / cell formatting ───────────────────────────────────────────────────
 // 1:1 replica of the document's own styling (sampled from the example rows and
@@ -42,6 +47,55 @@ const STATUS_CELL = {
   PENDING:  { bg: '#2d2208', fg: '#e3b341' },
 };
 
+// ── Staff Roster stamps ──────────────────────────────────────────────────────
+// Kept SEPARATE from the ban/war stamps above so restyling one tab never breaks
+// the other. Arial 9pt bold centered (same weight as the severity stamps).
+// Tier — Staff = blue, Senior = orange, Super = purple.
+const TIER_CELL = {
+  1: { bg: '#0d2538', fg: '#6cb6ff' },
+  2: { bg: '#2d1b0e', fg: '#f0883e' },
+  3: { bg: '#271d3d', fg: '#bc8cff' },
+};
+// Status — Active = green, LOA = grey, Suspended = red, Exempt = teal.
+const ROSTER_STATUS_CELL = {
+  active:    { bg: '#1a3028', fg: '#56d364' },
+  loa:       { bg: '#2d333b', fg: '#adbac7' },
+  suspended: { bg: '#3d1f1f', fg: '#f78166' },
+  exempt:    { bg: '#0c2b2b', fg: '#56d4dd' },
+};
+// Weekly Quota — Met = green, Missed = red, Exempt = teal, N/A (no quota set) = grey.
+const QUOTA_CELL = {
+  met:       { bg: '#1a3028', fg: '#56d364' },
+  missed:    { bg: '#3d1f1f', fg: '#f78166' },
+  exempt:    { bg: '#0c2b2b', fg: '#56d4dd' },
+  untracked: { bg: '#2d333b', fg: '#768390' },
+};
+// Promotion — Eligible = gold stamp (a colour used nowhere else on the tab so it
+// reads at a glance); otherwise plain muted "Not Eligible" text (no stamp).
+const PROMO_CELL = {
+  eligible: { bg: '#2d2208', fg: '#e3b341' },
+};
+
+// Cell text for the stamped columns. Full tier names + plain words to match the
+// example rows ("Staff" / "Senior Staff" / "Super Staff") — professional, no emojis.
+const TIER_LABEL = { 1: 'Staff', 2: 'Senior Staff', 3: 'Super Staff' };
+const ROSTER_STATUS_LABEL = { active: 'Active', loa: 'LOA', suspended: 'Suspended', exempt: 'Exempt' };
+const QUOTA_LABEL = { met: 'Met', missed: 'Missed', exempt: 'Exempt', untracked: 'N/A' };
+
+// Tenure reads "<n> Days" (singular "1 Day"), matching the example-row wording.
+function tenureLabel(days) {
+  const n = Number(days) || 0;
+  return `${n} ${n === 1 ? 'Day' : 'Days'}`;
+}
+
+// Subtle cell dividers for the roster tab (the thin grid lines on the example
+// rows). Applied to every roster cell so the generated rows match the examples.
+const ROSTER_DIVIDER = '#444c56';
+function rosterBorders() {
+  const side = { style: 'SOLID', color: hexToColor(ROSTER_DIVIDER) };
+  return { top: side, bottom: side, left: side, right: side };
+}
+
 function hexToColor(hex) {
   const n = parseInt(hex.replace('#', ''), 16);
   return { red: ((n >> 16) & 255) / 255, green: ((n >> 8) & 255) / 255, blue: (n & 255) / 255 };
@@ -62,9 +116,11 @@ async function getSheetId(sheetName) {
   return _sheetIdCache[sheetName];
 }
 
-// Builds a full userEnteredFormat matching the document base style.
-function cellFormat({ bg, fg = THEME.text, fontSize = 10, bold = false, hAlign = 'LEFT' }) {
-  return {
+// Builds a full userEnteredFormat matching the document base style. Pass `borders`
+// (a Borders object) to draw cell dividers; omit it to leave borders untouched
+// (ban/war tabs) — the field is only written when FMT_FIELDS_BORDERS is used.
+function cellFormat({ bg, fg = THEME.text, fontSize = 10, bold = false, hAlign = 'LEFT', borders = null }) {
+  const fmt = {
     backgroundColor: hexToColor(bg),
     horizontalAlignment: hAlign,
     verticalAlignment: 'MIDDLE',
@@ -77,9 +133,15 @@ function cellFormat({ bg, fg = THEME.text, fontSize = 10, bold = false, hAlign =
       foregroundColor: hexToColor(fg),
     },
   };
+  if (borders) fmt.borders = borders;
+  return fmt;
 }
 
 const FMT_FIELDS = 'userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,wrapStrategy,textFormat)';
+// Same, plus borders — used by the roster mirror so passing/omitting `borders`
+// either draws or clears the cell dividers (kept off the shared FMT_FIELDS so the
+// ban/war tabs are never touched).
+const FMT_FIELDS_BORDERS = `${FMT_FIELDS.slice(0, -1)},borders)`;
 
 // Applies the banded base style across the row, then per-column stamp overrides.
 // `overrides` is an array of { col, bg?, fg?, fontSize?, bold?, hAlign? }.
@@ -490,6 +552,104 @@ async function recordVerifiedPlayer({ discordId, discordTag = '', ign, uuid }) {
   return true;
 }
 
+// ── Staff Roster mirror (read-only dashboard) ─────────────────────────────────
+// One-way, display-only snapshot of the roster (data/roster.json is the source of
+// truth — never read back from here). Full-snapshot rewrite each refresh: clears
+// everything below the divider, writes every active-staff row, then applies row
+// banding + the C/D/E/H stamps in ONE batched call (so a 30-person roster is one
+// formatting request, not 30). No-ops (returns false) when the tab doesn't exist
+// so the scheduler can warn without ever crashing or blocking a command.
+//
+// Columns: A Onboard Date | B Staff Member | C Tier | D Status | E Weekly Quota |
+//          F Warns | G Strikes | H Promotion | I Tenure (days).
+// Each `row`: { onboardDate, tag, tier, statusKey, quotaState, warns, strikes,
+//              eligible, tenureDays }.
+async function writeRosterMirror(rows = [], { sheetName = ROSTER_SHEET_NAME, startRow = ROSTER_DATA_START_ROW } = {}) {
+  if (!sheetName) return false;
+  const sheetId = await getSheetId(sheetName);
+  if (sheetId === undefined) return false; // tab not created yet — caller warns
+
+  const sheets = await getSheetsClient();
+  const TOTAL_COLS = 9;
+
+  // How far the previous snapshot reached, so we can wipe leftover banding when the
+  // roster shrinks. findNextWriteRow returns the first empty/placeholder row.
+  const prevLastRow = Math.max(startRow, await findNextWriteRow(sheetName, startRow)) - 1;
+
+  // 1) Clear all values below the divider (snapshot — never append).
+  await withRetry(() => sheets.spreadsheets.values.clear({
+    spreadsheetId: SPREADSHEET_ID,
+    range: range(sheetName, `A${startRow}:I`),
+  }));
+
+  // 2) Write the new rows.
+  if (rows.length) {
+    const values = rows.map(r => [
+      (r.onboardDate || '').slice(0, 10),
+      r.tag || '',
+      TIER_LABEL[r.tier] || '—',
+      ROSTER_STATUS_LABEL[r.statusKey] || r.statusKey || '',
+      QUOTA_LABEL[r.quotaState] || '',
+      String(r.warns ?? 0),
+      String(r.strikes ?? 0),
+      r.eligible ? 'Eligible for Promotion' : 'Not Eligible',
+      tenureLabel(r.tenureDays),
+    ]);
+    await withRetry(() => sheets.spreadsheets.values.update({
+      spreadsheetId: SPREADSHEET_ID,
+      range: range(sheetName, `A${startRow}:I${startRow + rows.length - 1}`),
+      valueInputOption: 'USER_ENTERED',
+      requestBody: { values },
+    }));
+  }
+
+  // 3) One batched formatting pass (banding + cell dividers + per-column stamps).
+  const requests = [];
+  const cell = (rowNum, c0, c1, fmt) => requests.push({
+    repeatCell: {
+      range: { sheetId, startRowIndex: rowNum - 1, endRowIndex: rowNum, startColumnIndex: c0, endColumnIndex: c1 },
+      cell: { userEnteredFormat: fmt },
+      fields: FMT_FIELDS_BORDERS,
+    },
+  });
+  const borders = rosterBorders();
+
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    const rowNum = startRow + i;
+    const baseBg = rowNum % 2 === 1 ? THEME.rowOdd : THEME.rowEven;
+    // Stamps match the example rows: Arial 10pt bold, centered, with dividers.
+    const stamp = s => cellFormat({ bg: s?.bg || baseBg, fg: s?.fg, fontSize: 10, bold: true, hAlign: 'CENTER', borders });
+    const center = () => cellFormat({ bg: baseBg, hAlign: 'CENTER', borders });
+
+    cell(rowNum, 0, TOTAL_COLS, cellFormat({ bg: baseBg, borders }));  // A–I base banding + dividers
+    cell(rowNum, 2, 3, stamp(TIER_CELL[r.tier]));                      // C Tier
+    cell(rowNum, 3, 4, stamp(ROSTER_STATUS_CELL[r.statusKey]));        // D Status
+    cell(rowNum, 4, 5, stamp(QUOTA_CELL[r.quotaState]));               // E Weekly Quota
+    cell(rowNum, 5, 6, center());                                      // F Warns (centered)
+    cell(rowNum, 6, 7, center());                                      // G Strikes (centered)
+    cell(rowNum, 7, 8, r.eligible                                      // H Promotion
+      ? stamp(PROMO_CELL.eligible)
+      : cellFormat({ bg: baseBg, fg: THEME.muted, hAlign: 'CENTER', borders }));
+    cell(rowNum, 8, 9, center());                                      // I Tenure (centered)
+  }
+
+  // Clear banding AND dividers on rows a previous (larger) snapshot used but this
+  // one doesn't — omitting `borders` writes the cleared-border field via FMT_FIELDS_BORDERS.
+  for (let rowNum = startRow + rows.length; rowNum <= prevLastRow; rowNum++) {
+    const baseBg = rowNum % 2 === 1 ? THEME.rowOdd : THEME.rowEven;
+    cell(rowNum, 0, TOTAL_COLS, cellFormat({ bg: baseBg }));
+  }
+
+  if (requests.length) {
+    await withRetry(() => sheets.spreadsheets.batchUpdate({
+      spreadsheetId: SPREADSHEET_ID,
+      requestBody: { requests },
+    }));
+  }
+  return true;
+}
+
 module.exports = {
   normalizeBanId,
   formatBanId,
@@ -507,4 +667,5 @@ module.exports = {
   VERIFIED_SHEET_NAME,
   ensureVerifiedSheet,
   recordVerifiedPlayer,
+  writeRosterMirror,
 };
