@@ -306,6 +306,23 @@ npm test         # runs the unit tests (node --test) — no token/sheet needed
 > Set `GUILD_ID` in `.env` during development so commands register to your test
 > server **instantly** (global registration can take up to ~1 hour to propagate).
 
+### 5. Hosting it 24/7 (e.g. Railway)
+
+The bot is a long-running worker (no HTTP port). To host it where there's no
+committed key file and an ephemeral filesystem, two things matter:
+
+1. **Secrets as env vars.** Set every `.env` value in the host's dashboard. For the
+   Google key, **don't** commit `credentials.json` — instead set
+   `GOOGLE_CREDENTIALS_JSON` to the whole contents of that file (raw JSON or base64).
+   `getAuth()` prefers that env var and falls back to the file for local dev.
+2. **Persist `data/`.** All state (`roster.json`, `tickets.json`, warnings, notes,
+   flags, bans) lives in `data/`, which resolves to **`/app/data`** at runtime. Hosts
+   wipe the container filesystem on every redeploy, so attach a **persistent volume
+   mounted at `/app/data`** or you'll lose the roster/ticket state each deploy.
+
+Start command is `npm start`. Register slash commands once with `npm run deploy`
+(e.g. `railway run npm run deploy`) — it isn't part of `npm start`.
+
 ---
 
 ## Gotchas for the next dev

@@ -177,10 +177,26 @@ async function formatRow(sheetName, rowNumber, totalCols, overrides = []) {
 }
 
 // ── Auth ────────────────────────────────────────────────────────────────────
+// Prefer the service-account key from GOOGLE_CREDENTIALS_JSON (an env var holding
+// the whole credentials.json blob) — needed on hosts like Railway/Docker that have
+// no committed key file. Falls back to credentials.json on disk for local dev, so
+// nothing changes locally. The env value may be raw JSON or base64-encoded JSON.
 function getAuth() {
+  const scopes = ['https://www.googleapis.com/auth/spreadsheets'];
+  const raw = process.env.GOOGLE_CREDENTIALS_JSON;
+  if (raw && raw.trim()) {
+    let credentials;
+    try {
+      credentials = JSON.parse(raw);
+    } catch {
+      try { credentials = JSON.parse(Buffer.from(raw, 'base64').toString('utf8')); }
+      catch { throw new Error('GOOGLE_CREDENTIALS_JSON is set but is neither valid JSON nor base64-encoded JSON.'); }
+    }
+    return new google.auth.GoogleAuth({ credentials, scopes });
+  }
   return new google.auth.GoogleAuth({
     keyFile: path.join(__dirname, '..', 'credentials.json'),
-    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    scopes,
   });
 }
 
